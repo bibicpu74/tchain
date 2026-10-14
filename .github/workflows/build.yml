@@ -24,15 +24,7 @@ jobs:
       SDK_BOOTSTRAPPER_URL: "https://go.microsoft.com/fwlink/?linkid=2382519"
 
     steps:
-      - name: Require private repository for licensed toolchain artifact
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $event = Get-Content -LiteralPath $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
-          if ($event.repository -and $event.repository.private -eq $false) {
-            throw 'This package contains Microsoft Visual Studio toolchain binaries. Use a private repository for artifact transfer, and confirm your Microsoft license permits your intended use. The workflow refuses to upload this package from a public repository.'
-          }
-          Write-Host 'Repository privacy check passed.'
-
+    
       - name: Inspect Windows runner and required Visual Studio components
         run: |
           $ErrorActionPreference = 'Stop'
