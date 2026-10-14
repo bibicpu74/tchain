@@ -1,0 +1,214 @@
+name: Package Chromium Windows Toolchain (VS 2026 + Windows SDK 28000)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chromium-win-toolchain-package
+  cancel-in-progress: true
+
+jobs:
+  package-windows-toolchain:
+    # GitHub-hosted Windows Server 2025 image with Visual Studio 2026.
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      SDK_FAMILY: "10.0.28000.0"
+      SDK_BOOTSTRAPPER_URL: "https://go.microsoft.com/fwlink/?linkid=2382519"
+
+    steps:
+      - name: Require private repository for licensed toolchain artifact
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $event = Get-Content -LiteralPath $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
+          if ($event.repository -and $event.repository.private -eq $false) {
+            throw 'This package contains Microsoft Visual Studio toolchain binaries. Use a private repository for artifact transfer, and confirm your Microsoft license permits your intended use. The workflow refuses to upload this package from a public repository.'
+          }
+          Write-Host 'Repository privacy check passed.'
+
+      - name: Inspect Windows runner and required Visual Studio components
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "=== OS ==="
+          Get-CimInstance Win32_OperatingSystem | Select-Object Caption, Version, OSArchitecture | Format-List
+          Write-Host "=== Free disk space ==="
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{Name='FreeGiB';Expression={[math]::Round($_.Free / 1GB, 2)}}, @{Name='UsedGiB';Expression={[math]::Round($_.Used / 1GB, 2)}} | Format-Table -AutoSize
+          Write-Host "=== Python and Git ==="
+          py -3.12 --version
+          git --version
+
+          $programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+          $vswhere = Join-Path $programFilesX86 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path $vswhere)) { throw "vswhere.exe not found: $vswhere" }
+          $instances = & $vswhere -all -prerelease -products '*' -format json | ConvertFrom-Json
+          $vs = $instances | Where-Object { $_.installationPath -match '\\18\\' } | Select-Object -First 1
+          if (-not $vs) { throw 'Visual Studio 2026 (major version 18) is not installed on this runner.' }
+          $vsPath = $vs.installationPath
+          Write-Host "Visual Studio 2026: $vsPath"
+
+          $vcRoot = Join-Path $vsPath 'VC\Tools\MSVC'
+          $vcVersion = Get-ChildItem -LiteralPath $vcRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          if (-not $vcVersion) { throw "MSVC tools not found under $vcRoot" }
+          $required = @(
+            (Join-Path $vcVersion.FullName 'atlmfc\include\afxwin.h'),
+            (Join-Path $vcVersion.FullName 'atlmfc\lib\x64'),
+            (Join-Path $vcVersion.FullName 'atlmfc\lib\arm64'),
+            (Join-Path $vcVersion.FullName 'bin\HostX64\x64\cl.exe'),
+            (Join-Path $vcVersion.FullName 'bin\HostX64\arm64\cl.exe')
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) { throw "Required VS component is missing: $path. The packaging script needs the C++ desktop workload, MFC/ATL, and ARM64 tools." }
+          }
+          Write-Host "MSVC toolset: $($vcVersion.Name)"
+          Write-Host 'Visual Studio 2026 prerequisites look present.'
+
+      - name: Clone depot_tools only (no Chromium source)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $depotTools = Join-Path $env:RUNNER_TEMP 'depot_tools'
+          if (Test-Path $depotTools) { Remove-Item -LiteralPath $depotTools -Recurse -Force }
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $depotTools
+          if ($LASTEXITCODE -ne 0) { throw "git clone depot_tools failed with exit code $LASTEXITCODE" }
+          "DEPOT_TOOLS=$depotTools" >> $env:GITHUB_ENV
+          $env:PATH = "$depotTools;$env:PATH"
+          $env:PYTHONPATH = "$depotTools;$env:PYTHONPATH"
+          $commit = (git -C $depotTools rev-parse HEAD).Trim()
+          "DEPOT_TOOLS_COMMIT=$commit" >> $env:GITHUB_ENV
+          Write-Host "depot_tools commit: $commit"
+
+      - name: Install Windows 11 SDK 10.0.28000 family, including Debugging Tools
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $programFilesX86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+          $sdkRoot = Join-Path $programFilesX86 'Windows Kits\10'
+          $sdkInclude = Join-Path $sdkRoot "Include\$env:SDK_FAMILY"
+          $sdkLib = Join-Path $sdkRoot "Lib\$env:SDK_FAMILY"
+          $sdkInstaller = Join-Path $env:RUNNER_TEMP 'winsdksetup.exe'
+          $sdkLog = Join-Path $env:RUNNER_TEMP 'windows-sdk-install.log'
+
+          if ((Test-Path $sdkInclude) -and (Test-Path $sdkLib) -and (Test-Path (Join-Path $sdkRoot 'Debuggers'))) {
+            Write-Host "Windows SDK $env:SDK_FAMILY is already installed; skipping installer."
+          } else {
+            $freeGiB = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
+            Write-Host "Free space before SDK install: $freeGiB GiB"
+            if ($freeGiB -lt 5) { throw "Only $freeGiB GiB free on C:. Not enough headroom to install and package the Windows SDK safely." }
+
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri $env:SDK_BOOTSTRAPPER_URL -OutFile $sdkInstaller
+            if (-not (Test-Path $sdkInstaller)) { throw 'Failed to download the official Windows SDK installer.' }
+
+            # The Microsoft bootstrapper follows the current serviced SDK in the 10.0.28000 family.
+            # /features + installs the SDK features, including Desktop C++ libraries and Windows Debuggers.
+            $arguments = @('/features', '+', '/q', '/norestart', '/ceip', 'off', '/log', $sdkLog)
+            $process = Start-Process -FilePath $sdkInstaller -ArgumentList $arguments -Wait -PassThru
+            if ($process.ExitCode -notin @(0, 3010)) {
+              throw "Windows SDK installer failed with exit code $($process.ExitCode). Log: $sdkLog"
+            }
+            Remove-Item -LiteralPath $sdkInstaller -Force -ErrorAction SilentlyContinue
+          }
+
+          foreach ($path in @(
+            $sdkInclude,
+            (Join-Path $sdkLib 'um\x64'),
+            (Join-Path $sdkLib 'um\arm64'),
+            (Join-Path $sdkLib 'ucrt\x64'),
+            (Join-Path $sdkLib 'ucrt\arm64'),
+            (Join-Path $sdkRoot 'Debuggers')
+          )) {
+            if (-not (Test-Path $path)) { throw "Required Windows SDK path is missing: $path" }
+          }
+          Write-Host "Confirmed SDK directory family: $env:SDK_FAMILY"
+          Get-ChildItem -LiteralPath $sdkRoot -Directory | Select-Object -ExpandProperty Name
+          Write-Host 'Windows SDK headers, libraries, and Debuggers are present.'
+
+      - name: Check package headroom
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $freeGiB = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
+          Write-Host "Free space before packaging: $freeGiB GiB"
+          if ($freeGiB -lt 6) {
+            throw "Only $freeGiB GiB free on C:. The packaging script creates a ZIP and extracts it temporarily to calculate its hash; reclaim disk space and rerun."
+          }
+
+      - name: Validate toolchain inputs (dry run)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scriptPath = Join-Path $env:DEPOT_TOOLS 'win_toolchain\package_from_installed.py'
+          $dryRunLog = Join-Path $env:RUNNER_TEMP 'toolchain-dry-run.log'
+          $env:PATH = "$env:DEPOT_TOOLS;$env:PATH"
+          $env:PYTHONPATH = "$env:DEPOT_TOOLS;$env:PYTHONPATH"
+          Push-Location (Split-Path -Parent $scriptPath)
+          try {
+            & py -3.12 -u $scriptPath 2026 -w $env:SDK_FAMILY --dryrun 2>&1 | Tee-Object -FilePath $dryRunLog
+            if ($LASTEXITCODE -ne 0) { throw "Toolchain dry run failed with exit code $LASTEXITCODE" }
+            if (Select-String -LiteralPath $dryRunLog -Pattern 'does not exist\.' -Quiet) {
+              throw "The dry run found missing toolchain files. Review $dryRunLog in the runner log output."
+            }
+          } finally {
+            Pop-Location
+          }
+
+      - name: Package Visual Studio 2026 and Windows SDK 10.0.28000.0
+        id: package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scriptPath = Join-Path $env:DEPOT_TOOLS 'win_toolchain\package_from_installed.py'
+          $scriptDir = Split-Path -Parent $scriptPath
+          $artifactDir = Join-Path $env:GITHUB_WORKSPACE 'toolchain-artifact'
+          New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
+          $env:PATH = "$env:DEPOT_TOOLS;$env:PATH"
+          $env:PYTHONPATH = "$env:DEPOT_TOOLS;$env:PYTHONPATH"
+
+          Push-Location $scriptDir
+          try {
+            & py -3.12 -u $scriptPath 2026 -w $env:SDK_FAMILY
+            if ($LASTEXITCODE -ne 0) { throw "package_from_installed.py failed with exit code $LASTEXITCODE" }
+
+            $zip = Get-ChildItem -LiteralPath $scriptDir -File -Filter '*.zip' |
+              Where-Object { $_.BaseName -match '^[0-9a-fA-F]{10}$' } |
+              Sort-Object LastWriteTime -Descending |
+              Select-Object -First 1
+            if (-not $zip) { throw 'Packaging script returned success but the expected 10-character-hash ZIP was not found.' }
+
+            $destZip = Join-Path $artifactDir $zip.Name
+            Copy-Item -LiteralPath $zip.FullName -Destination $destZip -Force
+            $hash = (Get-FileHash -LiteralPath $destZip -Algorithm SHA256).Hash.ToLowerInvariant()
+            $size = (Get-Item -LiteralPath $destZip).Length
+            $manifest = @(
+              'Purpose=Chromium Windows cross-compilation toolchain package',
+              'VisualStudio=2026',
+              "WindowsSdkDirectoryVersion=$env:SDK_FAMILY",
+              'WindowsSdkInstaller=Microsoft Windows SDK 10.0.28000 family (current serviced release at run time)',
+              "DepotToolsCommit=$env:DEPOT_TOOLS_COMMIT",
+              "ToolchainZip=$($zip.Name)",
+              "SHA256=$hash",
+              "SizeBytes=$size",
+              "CreatedUTC=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+            )
+            $manifest | Set-Content -LiteralPath (Join-Path $artifactDir 'manifest.txt') -Encoding utf8
+            "zip_name=$($zip.Name)" >> $env:GITHUB_OUTPUT
+            "zip_sha256=$hash" >> $env:GITHUB_OUTPUT
+            Write-Host "Toolchain ZIP: $destZip"
+            Write-Host "ZIP size: $([math]::Round($size / 1GB, 2)) GiB"
+            Write-Host "SHA256: $hash"
+          } finally {
+            Pop-Location
+          }
+
+      - name: Upload toolchain ZIP for private retrieval
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-win-toolchain-vs2026-sdk28000
+          path: |
+            toolchain-artifact/*.zip
+            toolchain-artifact/manifest.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
