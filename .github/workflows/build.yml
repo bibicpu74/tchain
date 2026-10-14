@@ -2,9 +2,14 @@ name: Package Chromium Windows Toolchain (VS 2026 + Windows SDK 28000)
 
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to publish assets to (e.g., v2026-sdk28000)'
+        required: true
+        default: 'v2026-sdk28000'
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: chromium-win-toolchain-package
@@ -24,7 +29,6 @@ jobs:
       SDK_BOOTSTRAPPER_URL: "https://go.microsoft.com/fwlink/?linkid=2382519"
 
     steps:
-
       - name: Inspect Windows runner and required Visual Studio components
         run: |
           $ErrorActionPreference = 'Stop'
@@ -262,3 +266,28 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 3
+
+  publish-release:
+    needs: package-windows-toolchain
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download toolchain artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: chromium-win-toolchain-vs2026-sdk28000
+          path: toolchain-artifact
+
+      - name: Publish GitHub Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.release_tag }}
+          name: Chromium Windows Toolchain (${{ github.event.inputs.release_tag }})
+          body: |
+            Automated Chromium Windows Toolchain Package built with Visual Studio 2026 and Windows SDK 10.0.28000.0.
+          files: |
+            toolchain-artifact/*.zip
+            toolchain-artifact/manifest.txt
+          draft: false
+          prerelease: false
