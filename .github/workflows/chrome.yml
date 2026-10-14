@@ -1,0 +1,42 @@
+name: Cross-Build Chromium Win on Linux
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-win-on-linux:
+    runs-on: ubuntu-latest # Hoặc self-hosted linux
+    
+    steps:
+      - name: Setup Depot Tools
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
+          echo "$GITHUB_WORKSPACE/depot_tools" >> $GITHUB_PATH
+
+      - name: Download Custom Windows Toolchain
+        run: |
+          # Tải file zip toolchain bạn đã đóng gói ở Bước 1
+          wget -O win_toolchain.zip "https://github.com/bibicpu74/tchain/actions/runs/38542855428/artifacts/11886215112"
+          unzip win_toolchain.zip -d $GITHUB_WORKSPACE/win_toolchain
+
+      - name: Fetch Chromium Source
+        run: |
+          mkdir chromium_build && cd chromium_build
+          fetch --nohooks chromium
+          cd src
+          git checkout 155.0.8059.79
+          
+          # Tắt tải toolchain mặc định của Google
+          export DEPOT_TOOLS_WIN_TOOLCHAIN=0
+          gclient sync --with_branch_heads --with_tags -D
+
+      - name: Generate Build Files
+        run: |
+          cd chromium_build/src
+          # Cấu hình GN để chỉ đường dẫn tới toolchain custom của bạn
+          gn gen out/Default --args='target_os="win" target_cpu="x64" is_debug=false is_component_build=false symbol_level=0 custom_toolchain="//build/toolchain/win:win_clang_x64" visual_studio_path="/home/runner/work/your-repo/your-repo/win_toolchain"'
+
+      - name: Build Chromium
+        run: |
+          cd chromium_build/src
+          autoninja -C out/Default chrome
