@@ -24,7 +24,7 @@ jobs:
       SDK_BOOTSTRAPPER_URL: "https://go.microsoft.com/fwlink/?linkid=2382519"
 
     steps:
-    
+
       - name: Inspect Windows runner and required Visual Studio components
         run: |
           $ErrorActionPreference = 'Stop'
@@ -74,6 +74,64 @@ jobs:
           $commit = (git -C $depotTools rev-parse HEAD).Trim()
           "DEPOT_TOOLS_COMMIT=$commit" >> $env:GITHUB_ENV
           Write-Host "depot_tools commit: $commit"
+
+      - name: Patch depot_tools to select the newest installed MSVC toolset
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scriptPath = Join-Path $env:DEPOT_TOOLS 'win_toolchain\package_from_installed.py'
+          $patchPath = Join-Path $env:RUNNER_TEMP 'patch_package_script.py'
+          @'
+          from pathlib import Path
+          import os
+
+          script_path = Path(os.environ["DEPOT_TOOLS"]) / "win_toolchain" / "package_from_installed.py"
+          source = script_path.read_text(encoding="utf-8")
+          start = source.index("def ExpandWildcards(root, sub_dir):")
+          end = source.index("\n\ndef BuildRepackageFileList", start)
+          replacement = r'''def ExpandWildcards(root, sub_dir):
+              # normpath is needed to change '/' to '\\' characters.
+              # Hosted VS 2026 images can contain several side-by-side MSVC
+              # toolsets. For paths under MSVC/<version>, select the newest
+              # matching numeric version; retain strict behavior for other globs.
+              import re
+
+              path = os.path.normpath(os.path.join(root, sub_dir))
+              matches = glob.glob(path)
+              if len(matches) > 1:
+                  versioned_matches = []
+                  for candidate in matches:
+                      version_match = re.search(
+                          r"[\\/](?:Tools[\\/])?MSVC[\\/](\d+(?:\.\d+)+)(?:[\\/]|$)",
+                          candidate,
+                          re.IGNORECASE,
+                      )
+                      if not version_match:
+                          versioned_matches = []
+                          break
+                      version = tuple(
+                          int(part) for part in version_match.group(1).split(".")
+                      )
+                      versioned_matches.append((version, candidate))
+                  if versioned_matches and len(versioned_matches) == len(matches):
+                      newest_version = max(version for version, _ in versioned_matches)
+                      matches = [
+                          candidate
+                          for version, candidate in versioned_matches
+                          if version == newest_version
+                      ]
+              if len(matches) != 1:
+                  raise Exception(
+                      "%s had %d matches - should be one" % (path, len(matches))
+                  )
+              return matches[0]
+          '''
+          source = source[:start] + replacement.rstrip() + source[end:]
+          script_path.write_text(source, encoding="utf-8", newline="\n")
+          print(f"Patched {script_path}: selecting newest matching MSVC version")
+          '@ | Set-Content -LiteralPath $patchPath -Encoding utf8
+          & py -3.12 -u $patchPath
+          if ($LASTEXITCODE -ne 0) { throw "Failed to patch package_from_installed.py (exit code $LASTEXITCODE)" }
+          Get-Content -LiteralPath $scriptPath -TotalCount 130 | Select-Object -Last 40
 
       - name: Install Windows 11 SDK 10.0.28000 family, including Debugging Tools
         run: |
