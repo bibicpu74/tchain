@@ -16,7 +16,7 @@ jobs:
       - name: Download Custom Windows Toolchain
         run: |
           # Tải file zip toolchain bạn đã đóng gói ở Bước 1
-          wget -O win_toolchain.zip "https://store-na-phx-4.gofile.io/download/web/2bf1309f-07ad-40f5-9a2e-d114843b02c6/chromium-win-toolchain-vs2026-sdk28000.zip"
+          wget -O win_toolchain.zip "https://pub-8f1f5b85dfa3490cb6526249c67b4237.r2.dev/chromium-win-toolchain-vs2026-sdk28000.zip"
           unzip win_toolchain.zip -d $GITHUB_WORKSPACE/win_toolchain
 
       - name: Fetch Chromium Source
