@@ -43,7 +43,7 @@ jobs:
       BTRFS_ZSTD: '1'
       MIN_FREE_GIB: '12'
       BUILD_JOBS: '2'
-      RCLONE_VERSION: 'v1.75.2'
+      PINNED_RCLONE_VERSION: '1.75.2'
       # Keep the existing prefix to restore committed legacy layers.
       R2_ROOT: r2:${{ vars.R2_BUCKET || secrets.R2_BUCKET }}/chromium-win155-x64-v3
       R2_BUCKET: ${{ vars.R2_BUCKET || secrets.R2_BUCKET }}
@@ -96,21 +96,21 @@ jobs:
           sudo rm -rf /var/lib/apt/lists/*
 
           echo '=== Install pinned modern rclone (Ubuntu 24.04 apt is 1.60.1) ==='
-          RCLONE_TMP="$RUNNER_TEMP/rclone-${RCLONE_VERSION}"
+          RCLONE_TMP="$RUNNER_TEMP/rclone-v${PINNED_RCLONE_VERSION}"
           mkdir -p "$RCLONE_TMP"
-          RCLONE_FILE="rclone-${RCLONE_VERSION}-linux-amd64.zip"
+          RCLONE_FILE="rclone-v${PINNED_RCLONE_VERSION}-linux-amd64.zip"
           curl -fL --retry 5 --retry-delay 5 \
-            "https://downloads.rclone.org/${RCLONE_VERSION}/${RCLONE_FILE}" \
+            "https://downloads.rclone.org/v${PINNED_RCLONE_VERSION}/${RCLONE_FILE}" \
             -o "$RCLONE_TMP/$RCLONE_FILE"
           curl -fL --retry 5 --retry-delay 5 \
-            "https://downloads.rclone.org/${RCLONE_VERSION}/SHA256SUMS" \
+            "https://downloads.rclone.org/v${PINNED_RCLONE_VERSION}/SHA256SUMS" \
             -o "$RCLONE_TMP/SHA256SUMS"
           (cd "$RCLONE_TMP" && \
             awk -v file="$RCLONE_FILE" '$2 == file {print}' SHA256SUMS \
               | sha256sum --check -)
           unzip -q "$RCLONE_TMP/$RCLONE_FILE" -d "$RCLONE_TMP"
           sudo install -m 0755 \
-            "$RCLONE_TMP/rclone-${RCLONE_VERSION}-linux-amd64/rclone" \
+            "$RCLONE_TMP/rclone-v${PINNED_RCLONE_VERSION}-linux-amd64/rclone" \
             /usr/local/bin/rclone
           /usr/local/bin/rclone version
 
