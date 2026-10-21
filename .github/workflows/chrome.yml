@@ -173,6 +173,7 @@ jobs:
               rclone cat "$R2_ROOT/layers/$N.tar.zst" --retries 5 \
                 | zstd -d -T2 -c \
                 | tar -x --listed-incremental=/dev/null \
+                    --xattrs --xattrs-include='user.*' \
                     --no-same-owner --no-same-permissions -C "$WORK" -f -
             done
             rclone copyto "$R2_ROOT/state/$LAST.snar" "$RUNNER_TEMP/previous.snar" --retries 5
@@ -258,7 +259,7 @@ jobs:
             exit "$RC"
           fi
 
-      - name: Install VS 2026 SDK28000 toolchain (nested ZIP aware)
+      - name: Install VS 2026 SDK28000 toolchain (ciopfs-safe)
         id: toolchain
         if: steps.sync.outputs.ready == 'true'
         shell: bash
@@ -271,11 +272,42 @@ jobs:
           BACKING="$WORK/win_toolchain_backing"
           VIEW="$WORK/win_toolchain"
           CACHE="$WORK/toolchain-download"
+          # IMPORTANT: ciopfs maps visible mixed-case names onto lowercase
+          # filenames in BACKING. The previous workflow extracted ZIP entries
+          # with names such as VS_VERSION, VC, and Windows Kits directly into
+          # BACKING, making them invisible through VIEW.
+          # A failed previous run may have checkpointed that broken tree to R2.
+          # Clean only this corrupted toolchain tree, preserving the downloaded
+          # ZIP and all Chromium source/build outputs.
+          if mountpoint -q "$VIEW"; then
+            echo 'ciopfs mount already active.'
+          else
+            if [ -e "$BACKING/VS_VERSION" ] || \
+               [ -d "$BACKING/VC" ] || \
+               [ -d "$BACKING/Windows Kits" ]; then
+              echo '=== Repair previous uppercase ciopfs backing ==='
+              echo 'Detected ZIP files extracted directly to the backing tree.'
+              du -sh "$BACKING" || true
+              rm -rf "$BACKING"
+              echo 'Removed broken toolchain extraction; cached ZIP is retained.'
+            fi
+          fi
           mkdir -p "$BACKING" "$VIEW" "$CACHE"
           if ! mountpoint -q "$VIEW"; then
             ciopfs -o use_ino "$BACKING" "$VIEW"
           fi
           mountpoint -q "$VIEW" || { echo '::error::ciopfs mount failed'; exit 1; }
+          echo '=== Verify ciopfs write/read path ==='
+          printf 'case-insensitive-ok\n' > "$VIEW/CiOpFs-Sanity-Check"
+          test -f "$BACKING/ciopfs-sanity-check" || {
+            echo '::error::ciopfs did not create lowercase backing filename.'
+            exit 1
+          }
+          test "$(cat "$VIEW/CIOPFS-SANITY-CHECK")" = 'case-insensitive-ok' || {
+            echo '::error::ciopfs case-insensitive lookup failed.'
+            exit 1
+          }
+          rm -f "$VIEW/CiOpFs-Sanity-Check"
 
           # Existing backing files are checkpointed, but FUSE mount is NOT:
           # remount ciopfs before checking the toolchain on each new runner.
@@ -325,10 +357,11 @@ jobs:
 
             # The Windows packaging action uploaded a ZIP *inside* an Actions
             # Artifact. Python zipfile + normalized paths supports either format.
-            # Extract to the backing tree, not the ciopfs FUSE view.
+            # Extract THROUGH ciopfs VIEW. Direct writes to BACKING with
+            # uppercase names are invisible inside the FUSE mount.
             set +e
             timeout -s INT -k 90s "${LEFT}s" \
-              python3 - "$ZIP" "$BACKING" <<'PY'
+              python3 - "$ZIP" "$VIEW" <<'PY'
           import os
           import re
           import shutil
@@ -338,7 +371,7 @@ jobs:
           from pathlib import Path
 
           outer = Path(sys.argv[1])
-          backing = Path(sys.argv[2])
+          destination = Path(sys.argv[2])
           sdk = '10.0.28000.0'
 
           def norm(name):
@@ -425,9 +458,9 @@ jobs:
                                   'Nested ZIP does not contain MSVC + SDK '
                                   f'{sdk} + VS_VERSION: verify publishing URL.')
                           archives = [(nested, prefix)]
-                          extract(archives[0][0], archives[0][1], backing)
+                          extract(archives[0][0], archives[0][1], destination)
               else:
-                  extract(zf, prefix, backing)
+                  extract(zf, prefix, destination)
 
           PY
             RC=$?
@@ -439,10 +472,17 @@ jobs:
             fi
             (( RC == 0 )) || exit "$RC"
 
-            # Clean up files left by the previous Linux unzip implementation:
-            # a GitHub Artifact inner ZIP or Windows backslash-named flat files.
-            find "$BACKING" -maxdepth 1 -type f \
-              \( -name '*.zip' -o -name '*\\*' \) -print -delete || true
+            echo '=== Toolchain files now visible through ciopfs ==='
+            ls -ld "$VIEW/VS_VERSION" "$VIEW/VC/Tools/MSVC" \
+              "$VIEW/Windows Kits/10" || true
+            test -f "$VIEW/VS_VERSION" || {
+              echo '::error::VS_VERSION still not visible in ciopfs mount.'
+              echo 'Visible entries:'
+              ls -lah "$VIEW" | head -n 40
+              echo 'Backing entries:'
+              ls -lah "$BACKING" | head -n 40
+              exit 1
+            }
 
             # Configure Chromium using the packaged, already generated
             # SetEnv.x64.json (not a home-made INCLUDE/LIB approximation).
@@ -486,10 +526,9 @@ jobs:
               if not p.exists():
                   raise SystemExit(f'Missing toolchain component: {p}')
 
-          # Windows packager already generated these relative path lists.
-          # Normalize backslash tokens for Linux os.path.join(), preserving
-          # all original INCLUDE/LIB/PATH entries.
-          original = backing / 'Windows Kits/10/bin/SetEnv.x64.json'
+          # Windows packager already generated the original relative paths.
+          # Access/write ONLY via ciopfs VIEW, never directly through BACKING.
+          original = view / 'Windows Kits/10/bin/SetEnv.x64.json'
           data = json.loads(original.read_text())
           env = data['env']
           for key, groups in env.items():
@@ -656,6 +695,7 @@ jobs:
           echo "Streaming incremental tar layer ${NEXT} to R2"
           # The FUSE view is excluded. Its persistent backing directory is included.
           tar -c --no-check-device --one-file-system \
+            --xattrs --xattrs-include='user.*' \
             --listed-incremental="$NEW_STATE" \
             --exclude='./win_toolchain' \
             -C "$WORK" -f - . \
