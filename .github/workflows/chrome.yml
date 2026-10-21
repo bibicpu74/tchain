@@ -15,6 +15,13 @@ on:
         description: Maximum automatic passes
         type: string
         default: '12'
+      r2_upload_mode:
+        description: R2 upload mode (LineageOS-proven stream, or chunked fallback)
+        type: choice
+        options:
+          - stream
+          - chunked
+        default: stream
 
 permissions:
   contents: read
@@ -36,15 +43,18 @@ jobs:
       BTRFS_ZSTD: '1'
       MIN_FREE_GIB: '12'
       BUILD_JOBS: '2'
-      # Keep different configurations in distinct R2 prefixes.
-      R2_ROOT: r2:${{ vars.R2_BUCKET }}/chromium-win155-x64-v3
-      R2_BUCKET: ${{ vars.R2_BUCKET }}
+      RCLONE_VERSION: 'v1.75.2'
+      # Keep the existing prefix to restore committed legacy layers.
+      R2_ROOT: r2:${{ vars.R2_BUCKET || secrets.R2_BUCKET }}/chromium-win155-x64-v3
+      R2_BUCKET: ${{ vars.R2_BUCKET || secrets.R2_BUCKET }}
       RCLONE_CONFIG_R2_TYPE: s3
       RCLONE_CONFIG_R2_PROVIDER: Cloudflare
       RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
       RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
       RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
       RCLONE_CONFIG_R2_REGION: auto
+      RCLONE_CONFIG_R2_NO_CHECK_BUCKET: 'true'
+      R2_UPLOAD_MODE: ${{ inputs.r2_upload_mode || 'stream' }}
       DEPOT_TOOLS_WIN_TOOLCHAIN: '1'
       GIT_TERMINAL_PROMPT: '0'
       TOOLCHAIN_URL: https://pub-8f1f5b85dfa3490cb6526249c67b4237.r2.dev/chromium-win-toolchain-vs2026-sdk28000.zip
@@ -81,9 +91,28 @@ jobs:
           sudo apt-get clean || true
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            btrfs-progs ciopfs fuse3 rclone zstd unzip jq git git-lfs ninja-build
+            btrfs-progs ciopfs fuse3 zstd unzip jq git git-lfs ninja-build
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
+
+          echo '=== Install pinned modern rclone (Ubuntu 24.04 apt is 1.60.1) ==='
+          RCLONE_TMP="$RUNNER_TEMP/rclone-${RCLONE_VERSION}"
+          mkdir -p "$RCLONE_TMP"
+          RCLONE_FILE="rclone-${RCLONE_VERSION}-linux-amd64.zip"
+          curl -fL --retry 5 --retry-delay 5 \
+            "https://downloads.rclone.org/${RCLONE_VERSION}/${RCLONE_FILE}" \
+            -o "$RCLONE_TMP/$RCLONE_FILE"
+          curl -fL --retry 5 --retry-delay 5 \
+            "https://downloads.rclone.org/${RCLONE_VERSION}/SHA256SUMS" \
+            -o "$RCLONE_TMP/SHA256SUMS"
+          (cd "$RCLONE_TMP" && \
+            awk -v file="$RCLONE_FILE" '$2 == file {print}' SHA256SUMS \
+              | sha256sum --check -)
+          unzip -q "$RCLONE_TMP/$RCLONE_FILE" -d "$RCLONE_TMP"
+          sudo install -m 0755 \
+            "$RCLONE_TMP/rclone-${RCLONE_VERSION}-linux-amd64/rclone" \
+            /usr/local/bin/rclone
+          /usr/local/bin/rclone version
 
           cat > "$GITHUB_WORKSPACE/ci-metrics.sh" <<'SH'
           ci_metrics() {
@@ -136,6 +165,44 @@ jobs:
           mkdir -p "$WORK"
           findmnt /mnt/chromium-ci
 
+      - name: Preflight R2 upload method before Chromium build
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin 'R2 upload preflight'
+          echo "R2 upload mode: $R2_UPLOAD_MODE"
+          echo 'Rclone configuration: Cloudflare S3, no_check_bucket=true'
+          test "$(rclone version | head -1)" = "rclone v1.75.2"
+          PROBE="$R2_ROOT/probes/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${R2_UPLOAD_MODE}.bin"
+          if [ "$R2_UPLOAD_MODE" = stream ]; then
+            echo '=== Test 70 MiB multipart rcat before spending hours compiling ==='
+            # Over 64 MiB cutoff, so this tests multipart POST, not just PutObject.
+            head -c $((70*1024*1024)) /dev/zero \
+              | rclone rcat "$PROBE" \
+                  --stats 30s --stats-one-line \
+                  --s3-upload-cutoff 64M \
+                  --s3-chunk-size 64M \
+                  --s3-upload-concurrency 4
+            EXPECTED=$((70*1024*1024))
+          elif [ "$R2_UPLOAD_MODE" = chunked ]; then
+            echo '=== Test single-PUT rclone copyto fallback ==='
+            printf 'chromium-r2-single-put-%s\n' "$GITHUB_RUN_ID" > "$RUNNER_TEMP/r2-test.txt"
+            rclone copyto "$RUNNER_TEMP/r2-test.txt" "$PROBE" \
+              --s3-upload-cutoff 512M --retries 5
+            EXPECTED="$(stat -c %s "$RUNNER_TEMP/r2-test.txt")"
+          else
+            echo "::error::Unknown R2_UPLOAD_MODE=$R2_UPLOAD_MODE"
+            exit 1
+          fi
+          ACTUAL="$(rclone size "$PROBE" --json | jq -r '.bytes')"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::R2 preflight size mismatch expected=$EXPECTED actual=$ACTUAL"
+            exit 1
+          fi
+          rclone deletefile "$PROBE" || true
+          echo 'R2 upload preflight=PASS'
+
       - name: Restore committed checkpoint from R2
         id: restore
         shell: bash
@@ -170,11 +237,95 @@ jobs:
           if (( LAST > 0 )); then
             for N in $(seq 1 "$LAST"); do
               echo "=== Restoring layer $N/$LAST ==="
-              rclone cat "$R2_ROOT/layers/$N.tar.zst" --retries 5 \
-                | zstd -d -T2 -c \
-                | tar -x --listed-incremental=/dev/null \
-                    --xattrs --xattrs-include='user.*' \
-                    --no-same-owner --no-same-permissions -C "$WORK" -f -
+              # v4 checkpoint: independently uploaded 256MiB single-PUT objects.
+              # Continue to read previously committed v3 .tar.zst layers.
+              LAYER_LIST="$(rclone lsjson "$R2_ROOT/layers/$N" --files-only --no-modtime --no-mimetype)"
+              if jq -e '[.[] | select(.Name == "manifest.json")] | length == 1' \
+                <<< "$LAYER_LIST" >/dev/null; then
+                MANIFEST="$RUNNER_TEMP/r2-manifest-$N.json"
+                rclone copyto "$R2_ROOT/layers/$N/manifest.json" "$MANIFEST" --retries 5
+                python3 - "$R2_ROOT/layers/$N" "$MANIFEST" "$RUNNER_TEMP" <<'PYRESTORE' \
+                  | zstd -d -T2 -c \
+                  | tar -x --listed-incremental=/dev/null \
+                      --xattrs --xattrs-include='user.*' \
+                      --no-same-owner --no-same-permissions -C "$WORK" -f -
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          prefix, manifest_path, scratch = sys.argv[1:]
+          manifest = json.loads(Path(manifest_path).read_text())
+          if manifest.get('format') != 'chunked-zstd-tar-v1':
+              raise SystemExit('Unsupported checkpoint format')
+          parts = manifest.get('parts')
+          if not isinstance(parts, list) or not parts:
+              raise SystemExit('Empty or invalid checkpoint manifest')
+          scratch = Path(scratch)
+          for i, part in enumerate(parts):
+              name = part.get('name', '')
+              if name != f'part-{i:06d}.bin':
+                  raise SystemExit(f'Unexpected checkpoint part: {name!r}')
+              expected_size = part.get('size')
+              expected_sha = part.get('sha256', '')
+              if not isinstance(expected_size, int) or not (0 < expected_size <= 256*1024*1024):
+                  raise SystemExit(f'Invalid part size: {expected_size}')
+              if not re.fullmatch('[0-9a-f]{64}', expected_sha):
+                  raise SystemExit(f'Invalid SHA256 for {name}')
+              local = scratch / f'r2-restore-{i:06d}.bin'
+              try:
+                  print(f'Restoring {name} ({expected_size} bytes)', file=sys.stderr, flush=True)
+                  subprocess.run(['rclone', 'copyto', f'{prefix}/{name}', str(local),
+                                  '--retries', '5', '--low-level-retries', '10'], check=True)
+                  digest = hashlib.sha256()
+                  total = 0
+                  with local.open('rb') as f:
+                      while True:
+                          buf = f.read(4*1024*1024)
+                          if not buf:
+                              break
+                          total += len(buf)
+                          digest.update(buf)
+                  if total != expected_size or digest.hexdigest() != expected_sha:
+                      raise SystemExit(f'Corrupt checkpoint part {name}; refusing restore')
+                  with local.open('rb') as f:
+                      while True:
+                          buf = f.read(4*1024*1024)
+                          if not buf:
+                              break
+                          sys.stdout.buffer.write(buf)
+              finally:
+                  local.unlink(missing_ok=True)
+          sys.stdout.buffer.flush()
+          PYRESTORE
+              else
+                echo "Single-object checkpoint: $N.tar.zst"
+                EXPECTED_HASH="$RUNNER_TEMP/layer-$N-expected.sha256"
+                RECEIVED_HASH="$RUNNER_TEMP/layer-$N-received.sha256"
+                HAS_SHA=0
+                if rclone lsf "$R2_ROOT/layers" --files-only \
+                    | grep -Fxq "$N.sha256"; then
+                  rclone copyto "$R2_ROOT/layers/$N.sha256" "$EXPECTED_HASH" --retries 5
+                  test -s "$EXPECTED_HASH"
+                  HAS_SHA=1
+                fi
+                # Hash compressed data while streaming; do not buffer huge archives.
+                HASH_RELAY=$'import hashlib,sys\nh=hashlib.sha256(); i=sys.stdin.buffer; o=sys.stdout.buffer\nwhile True:\n b=i.read(8*1024*1024)\n if not b: break\n h.update(b); o.write(b); o.flush()\nopen(sys.argv[1],"w").write(h.hexdigest()+"\\n")'
+                rclone cat "$R2_ROOT/layers/$N.tar.zst" --stats 30s --stats-one-line \
+                  | python3 -c "$HASH_RELAY" "$RECEIVED_HASH" \
+                  | zstd -d -T2 -c \
+                  | tar -x --listed-incremental=/dev/null \
+                      --xattrs --xattrs-include='user.*' \
+                      --no-same-owner --no-same-permissions -C "$WORK" -f -
+                if (( HAS_SHA )); then
+                  cmp -s "$EXPECTED_HASH" "$RECEIVED_HASH" || {
+                    echo "::error::Checkpoint $N compressed SHA256 mismatch"
+                    exit 1
+                  }
+                fi
+              fi
             done
             rclone copyto "$R2_ROOT/state/$LAST.snar" "$RUNNER_TEMP/previous.snar" --retries 5
             test -s "$RUNNER_TEMP/previous.snar"
@@ -678,7 +829,7 @@ jobs:
             exit "$RC"
           fi
 
-      - name: Upload incremental checkpoint to R2
+      - name: Upload verified incremental checkpoint to R2
         id: checkpoint
         if: ${{ always() && steps.restore.outcome == 'success' }}
         shell: bash
@@ -692,27 +843,131 @@ jobs:
           if (( PREV > 0 )); then
             cp "$RUNNER_TEMP/previous.snar" "$NEW_STATE"
           fi
-          echo "Streaming incremental tar layer ${NEXT} to R2"
-          # The FUSE view is excluded. Its persistent backing directory is included.
+
+          echo "=== Checkpoint layer $NEXT, upload_mode=$R2_UPLOAD_MODE ==="
+          # GNU tar snapshot state will only be committed after remote verification.
+          if [ "$R2_UPLOAD_MODE" = stream ]; then
+            # Identical S3 multipart parameters to the successful LineageOS workflow.
+            HASH_FILE="$RUNNER_TEMP/layer-$NEXT.sha256"
+            BYTES_FILE="$RUNNER_TEMP/layer-$NEXT.bytes"
+            REMOTE="$R2_ROOT/layers/$NEXT.tar.zst"
+            HASH_RELAY=$'import hashlib,sys\nh=hashlib.sha256(); n=0\ni=sys.stdin.buffer; o=sys.stdout.buffer\nwhile True:\n b=i.read(8*1024*1024)\n if not b: break\n h.update(b); n+=len(b); o.write(b); o.flush()\nopen(sys.argv[1],"w").write(h.hexdigest()+"\\n")\nopen(sys.argv[2],"w").write(str(n)+"\\n")'
+            echo "=== Stream GNU tar incremental ZSTD1 directly to R2 ==="
+            tar -c --no-check-device --one-file-system \
+              --xattrs --xattrs-include='user.*' \
+              --listed-incremental="$NEW_STATE" \
+              --exclude='./win_toolchain' \
+              -C "$WORK" -f - . \
+              | zstd -1 -T2 -c \
+              | python3 -c "$HASH_RELAY" "$HASH_FILE" "$BYTES_FILE" \
+              | rclone rcat "$REMOTE" \
+                  --stats 30s --stats-one-line \
+                  --s3-upload-cutoff 64M \
+                  --s3-chunk-size 64M \
+                  --s3-upload-concurrency 4
+
+            test -s "$HASH_FILE"
+            test -s "$BYTES_FILE"
+            LOCAL_BYTES="$(tr -d '[:space:]' < "$BYTES_FILE")"
+            [[ "$LOCAL_BYTES" =~ ^[1-9][0-9]*$ ]]
+            REMOTE_BYTES="$(rclone size "$REMOTE" --json | jq -r '.bytes')"
+            if [ "$LOCAL_BYTES" != "$REMOTE_BYTES" ]; then
+              echo "::error::R2 layer size mismatch local=$LOCAL_BYTES remote=$REMOTE_BYTES"
+              exit 1
+            fi
+            # Sidecar is uploaded only once the large object exists and matches size.
+            rclone copyto "$HASH_FILE" "$R2_ROOT/layers/$NEXT.sha256" --retries 5
+            rclone copyto "$BYTES_FILE" "$R2_ROOT/layers/$NEXT.bytes" --retries 5
+            echo "R2 stream uploaded: ${REMOTE_BYTES} bytes, SHA256=$(cat "$HASH_FILE")"
+          elif [ "$R2_UPLOAD_MODE" = chunked ]; then
+            echo 'Using the existing 256 MiB single-PUT fallback.'
+          cat > "$RUNNER_TEMP/r2-upload-chunks.py" <<'PYUPLOAD'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          prefix = sys.argv[1]
+          scratch = Path(sys.argv[2])
+          parts = []
+          part_bytes = 256 * 1024 * 1024
+          index = 0
+          while True:
+              temp = tempfile.NamedTemporaryFile(
+                  prefix='r2-chunk-', suffix='.bin', dir=scratch, delete=False)
+              local = Path(temp.name)
+              digest = hashlib.sha256()
+              written = 0
+              try:
+                  with temp:
+                      while written < part_bytes:
+                          buf = sys.stdin.buffer.read(min(4*1024*1024, part_bytes-written))
+                          if not buf:
+                              break
+                          temp.write(buf)
+                          digest.update(buf)
+                          written += len(buf)
+                  if written == 0:
+                      break
+                  name = f'part-{index:06d}.bin'
+                  print(f'Uploading {name}: {written/1024**2:.1f} MiB',
+                        file=sys.stderr, flush=True)
+                  subprocess.run([
+                      'rclone', 'copyto', str(local), f'{prefix}/{name}',
+                      '--s3-upload-cutoff', '512M',
+                      '--retries', '5', '--low-level-retries', '10',
+                      '--stats', '60s', '--stats-one-line'
+                  ], check=True)
+                  parts.append({'name': name, 'size': written,
+                                'sha256': digest.hexdigest()})
+                  index += 1
+              finally:
+                  local.unlink(missing_ok=True)
+          if not parts:
+              raise SystemExit('No compressed checkpoint data produced')
+          manifest = {'format': 'chunked-zstd-tar-v1',
+                      'part_bytes': part_bytes,
+                      'parts': parts}
+          manifest_path = scratch / 'r2-upload-manifest.json'
+          manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+          subprocess.run([
+              'rclone', 'copyto', str(manifest_path), f'{prefix}/manifest.json',
+              '--s3-upload-cutoff', '512M', '--retries', '5'
+          ], check=True)
+          print(f'Uploaded {len(parts)} verified-size chunks and manifest',
+                file=sys.stderr, flush=True)
+          PYUPLOAD
+
+          echo "Streaming compressed incremental layer ${NEXT} as 256MiB single-PUT objects"
+          # The FUSE view is excluded; backing and xattrs are included.
+          # pipefail makes producer and uploader failures block the commit.
           tar -c --no-check-device --one-file-system \
             --xattrs --xattrs-include='user.*' \
             --listed-incremental="$NEW_STATE" \
             --exclude='./win_toolchain' \
             -C "$WORK" -f - . \
             | zstd -1 -T2 -c \
-            | rclone rcat "$R2_ROOT/layers/$NEXT.tar.zst" \
-                --s3-chunk-size 32M --s3-upload-concurrency 2 \
-                --stats 60s --stats-one-line
+            | python3 "$RUNNER_TEMP/r2-upload-chunks.py" \
+                "$R2_ROOT/layers/$NEXT" "$RUNNER_TEMP"
 
+          else
+            echo "::error::Unsupported upload mode $R2_UPLOAD_MODE"
+            exit 1
+          fi
+
+          test -s "$NEW_STATE"
           rclone copyto "$NEW_STATE" "$R2_ROOT/state/$NEXT.snar" --retries 5
-          # Publish pointer last, only after archive and .snar were uploaded.
+          # Publish pointer LAST, after all data and metadata are durable.
           printf '%s\n' "$NEXT" > "$RUNNER_TEMP/latest-new.txt"
           rclone copyto "$RUNNER_TEMP/latest-new.txt" "$R2_ROOT/latest.txt" --retries 5
           rclone copyto "$R2_ROOT/latest.txt" "$RUNNER_TEMP/latest-verify.txt" --retries 5
           cmp -s "$RUNNER_TEMP/latest-new.txt" "$RUNNER_TEMP/latest-verify.txt"
           echo "committed=true" >> "$GITHUB_OUTPUT"
           echo "layer=$NEXT" >> "$GITHUB_OUTPUT"
-          echo "Checkpoint $NEXT committed and verified."
+          echo "Checkpoint $NEXT committed and verified (mode=$R2_UPLOAD_MODE)."
 
       - name: Dispatch next pass
         if: >-
@@ -749,6 +1004,7 @@ jobs:
             -f "ref=${GITHUB_REF_NAME}" \
             -f "inputs[pass]=$NEXT" \
             -f "inputs[max_passes]=$MAX" \
+            -f "inputs[r2_upload_mode]=$R2_UPLOAD_MODE" \
             -f 'inputs[auto_resume]=true'
 
       - name: Final resource and build summary
@@ -768,6 +1024,7 @@ jobs:
             echo "- Version: $CHROMIUM_VERSION"
             echo "- Btrfs image: ${IMAGE_GIB} GiB / ZSTD level ${BTRFS_ZSTD}"
             echo "- Checkpoint prefix: $R2_ROOT"
+            echo "- R2 upload mode: $R2_UPLOAD_MODE"
             echo "- Restored layer: ${RESTORED_LAST:-0}"
             echo "- Committed layer: ${{ steps.checkpoint.outputs.layer || 'none' }}"
             echo "- Build completed: ${{ steps.build.outputs.completed || 'false' }}"
