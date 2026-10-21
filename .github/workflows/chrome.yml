@@ -258,128 +258,270 @@ jobs:
             exit "$RC"
           fi
 
-      - name: Install VS 2026 SDK28000 toolchain
+      - name: Install VS 2026 SDK28000 toolchain (nested ZIP aware)
         id: toolchain
         if: steps.sync.outputs.ready == 'true'
         shell: bash
         run: |
           set -euo pipefail
           source "$GITHUB_WORKSPACE/ci-metrics.sh"
-          ci_begin 'Windows toolchain'
+          ci_begin 'Windows toolchain - inspect, extract and validate'
           export PATH="$WORK/depot_tools:$PATH"
           SRC="$WORK/chromium_build/src"
-          DEADLINE=$((RUN_START + 260*60))
-          LEFT=$((DEADLINE - $(date +%s)))
-          if (( LEFT < 1200 )); then
-            echo 'Toolchain deferred to the next pass to reserve R2 upload time.'
-            echo 'resume=true' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           BACKING="$WORK/win_toolchain_backing"
           VIEW="$WORK/win_toolchain"
-          mkdir -p "$BACKING" "$VIEW"
+          CACHE="$WORK/toolchain-download"
+          mkdir -p "$BACKING" "$VIEW" "$CACHE"
           if ! mountpoint -q "$VIEW"; then
             ciopfs -o use_ino "$BACKING" "$VIEW"
           fi
           mountpoint -q "$VIEW" || { echo '::error::ciopfs mount failed'; exit 1; }
 
-          if [ ! -f "$WORK/.win-toolchain-ready" ] || \
-             [ ! -f "$SRC/build/win_toolchain.json" ]; then
-            ZIP="$RUNNER_TEMP/windows-toolchain.zip"
-            LEFT=$((DEADLINE - $(date +%s)))
-            set +e
-            timeout -s INT -k 90s "${LEFT}s" \
-              curl -fL --retry 5 --retry-delay 5 "$TOOLCHAIN_URL" -o "$ZIP"
-            RC=$?
-            set -e
-            if (( RC == 124 )); then
-              echo 'Toolchain download time slice elapsed.'
+          # Existing backing files are checkpointed, but FUSE mount is NOT:
+          # remount ciopfs before checking the toolchain on each new runner.
+          if [ -f "$WORK/.win-toolchain-ready" ] && \
+             [ -f "$SRC/build/win_toolchain.json" ] && \
+             [ -f "$VIEW/VS_VERSION" ] && \
+             [ -f "$VIEW/Windows Kits/10/bin/SetEnv.x64.json" ]; then
+            echo 'Restored VS/SDK package; skipping download and extraction.'
+          else
+            LEFT=$((RUN_START + 260*60 - $(date +%s)))
+            if (( LEFT < 1200 )); then
+              echo 'Not enough time left to download/extract; checkpointing.'
               echo 'resume=true' >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            (( RC == 0 )) || exit "$RC"
+
+            ZIP="$CACHE/package.zip"
+            if [ ! -s "$ZIP" ]; then
+              echo '=== Downloading toolchain ZIP to persistent Btrfs cache ==='
+              # A .part download is not trusted; resume transfers only if server
+              # supports HTTP Range, otherwise curl restarts the download.
+              set +e
+              timeout -s INT -k 90s "${LEFT}s" \
+                curl -fL --retry 5 --retry-delay 5 \
+                  --continue-at - "$TOOLCHAIN_URL" -o "$CACHE/package.part"
+              RC=$?
+              set -e
+              if (( RC == 124 )); then
+                echo 'Toolchain transfer time slice reached.'
+                echo 'resume=true' >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              (( RC == 0 )) || exit "$RC"
+              mv "$CACHE/package.part" "$ZIP"
+            fi
             if [ -n "${TOOLCHAIN_SHA256:-}" ]; then
               echo "$TOOLCHAIN_SHA256  $ZIP" | sha256sum -c -
             fi
-            LEFT=$((DEADLINE - $(date +%s)))
+
+            echo '=== Inspect ZIP nesting, entries and SDK version ==='
+            LEFT=$((RUN_START + 260*60 - $(date +%s)))
             if (( LEFT < 300 )); then
-              echo 'Toolchain extraction deferred for checkpoint.'
+              echo 'Not enough time for extraction; preserving ZIP in R2 checkpoint.'
               echo 'resume=true' >> "$GITHUB_OUTPUT"
               exit 0
             fi
+
+            # The Windows packaging action uploaded a ZIP *inside* an Actions
+            # Artifact. Python zipfile + normalized paths supports either format.
+            # Extract to the backing tree, not the ciopfs FUSE view.
             set +e
-            timeout -s INT -k 90s "${LEFT}s" unzip -oq "$ZIP" -d "$VIEW"
+            timeout -s INT -k 90s "${LEFT}s" \
+              python3 - "$ZIP" "$BACKING" <<'PY'
+          import os
+          import re
+          import shutil
+          import sys
+          import tempfile
+          import zipfile
+          from pathlib import Path
+
+          outer = Path(sys.argv[1])
+          backing = Path(sys.argv[2])
+          sdk = '10.0.28000.0'
+
+          def norm(name):
+              # ZIPs produced on Windows may use either slash convention.
+              return name.replace('\\', '/').lstrip('./')
+
+          def summary(zf, label):
+              names = [norm(i.filename) for i in zf.infolist()]
+              print(f'{label}: {len(names)} entries', flush=True)
+              for name in names[:18]:
+                  print('  ZIP:', name, flush=True)
+              return names
+
+          def package_prefix(names):
+              # Official package_from_installed.py includes VS_VERSION at root.
+              markers = [n[:-len('VS_VERSION')] for n in names
+                         if n.casefold().endswith('vs_version')]
+              for prefix in sorted(markers, key=len):
+                  low = [n[len(prefix):].lower() for n in names
+                         if n.startswith(prefix)]
+                  has_vs = any(re.match(
+                      r'vc/tools/msvc/[^/]+/include/', n) for n in low)
+                  has_sdk = any(n.startswith(
+                      f'windows kits/10/include/{sdk.lower()}/') for n in low)
+                  if has_vs and has_sdk:
+                      return prefix
+              return None
+
+          def extract(zf, prefix, dest):
+              count = 0
+              for info in zf.infolist():
+                  path = norm(info.filename)
+                  if not path.startswith(prefix):
+                      continue
+                  relative = path[len(prefix):]
+                  if not relative or info.is_dir() or path.endswith('/'):
+                      continue
+                  parts = relative.split('/')
+                  if any(p in ('', '.', '..') for p in parts) or ':' in parts[0]:
+                      raise SystemExit(f'Unsafe path in ZIP: {relative!r}')
+                  target = dest.joinpath(*parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  # Atomic replacement avoids trusting partial extracted files
+                  # when the process is interrupted and a later pass resumes.
+                  tmp = target.with_name(target.name + '.ci-unpacking')
+                  with zf.open(info) as src, open(tmp, 'wb') as out:
+                      shutil.copyfileobj(src, out, length=2 * 1024 * 1024)
+                  os.replace(tmp, target)
+                  count += 1
+                  if count % 3000 == 0:
+                      print(f'Extracted {count} files...', flush=True)
+              print(f'Extracted {count} package files to {dest}', flush=True)
+              if count == 0:
+                  raise SystemExit('ZIP selection contained no files')
+
+          with zipfile.ZipFile(outer) as zf:
+              names = summary(zf, 'Downloaded archive')
+              prefix = package_prefix(names)
+              if prefix is None:
+                  candidates = [i for i in zf.infolist()
+                                if re.search(r'(?i)(?:^|/)[0-9a-f]{10}\.zip$',
+                                             norm(i.filename))]
+                  if len(candidates) != 1:
+                      candidates = [i for i in zf.infolist()
+                                    if norm(i.filename).lower().endswith('.zip')]
+                  if len(candidates) != 1:
+                      raise SystemExit(
+                          'Archive contains no VS_VERSION/MSVC/SDK tree and '
+                          f'{len(candidates)} nested ZIP candidates; '
+                          'expected toolchain ZIP or a GitHub Artifact ZIP.')
+                  inner_name = norm(candidates[0].filename)
+                  print('Found nested toolchain ZIP:', inner_name, flush=True)
+                  with tempfile.NamedTemporaryFile(
+                      dir=outer.parent, suffix='.zip') as temp:
+                      with zf.open(candidates[0]) as src:
+                          shutil.copyfileobj(src, temp, length=4 * 1024 * 1024)
+                      temp.flush()
+                      with zipfile.ZipFile(temp.name) as nested:
+                          summary(nested, 'Nested package')
+                          prefix = package_prefix(
+                              [norm(i.filename) for i in nested.infolist()])
+                          if prefix is None:
+                              raise SystemExit(
+                                  'Nested ZIP does not contain MSVC + SDK '
+                                  f'{sdk} + VS_VERSION: verify publishing URL.')
+                          archives = [(nested, prefix)]
+                          extract(archives[0][0], archives[0][1], backing)
+              else:
+                  extract(zf, prefix, backing)
+
+          PY
             RC=$?
             set -e
             if (( RC == 124 )); then
-              echo 'Toolchain extraction paused by time limit.'
+              echo 'Toolchain extraction time slice elapsed; retry next pass.'
               echo 'resume=true' >> "$GITHUB_OUTPUT"
               exit 0
             fi
             (( RC == 0 )) || exit "$RC"
-            rm -f "$ZIP"
 
-            python3 - "$VIEW" "$SRC" <<'PY'
+            # Clean up files left by the previous Linux unzip implementation:
+            # a GitHub Artifact inner ZIP or Windows backslash-named flat files.
+            find "$BACKING" -maxdepth 1 -type f \
+              \( -name '*.zip' -o -name '*\\*' \) -print -delete || true
+
+            # Configure Chromium using the packaged, already generated
+            # SetEnv.x64.json (not a home-made INCLUDE/LIB approximation).
+            python3 - "$VIEW" "$BACKING" "$SRC" <<'PY'
           import json
           import re
           import sys
           from pathlib import Path
 
-          root, src = map(Path, sys.argv[1:])
-          version = '10.0.28000.0'
-          script = (src/'build/vs_toolchain.py').read_text()
-          match = re.search(r'^SDK_VERSION\s*=\s*[\'\"]([^\'\"]+)', script, re.M)
-          if match and match.group(1) != version:
-              raise SystemExit(f'Chromium requires SDK {match.group(1)}, ZIP is for {version}')
+          view, backing, src = map(Path, sys.argv[1:])
+          setup = src / 'build/toolchain/win/setup_toolchain.py'
+          source = setup.read_text()
+          match = re.search(r'^SDK_VERSION\s*=\s*[\'\"]([^\'\"]+)', source, re.M)
+          expected_sdk = match.group(1) if match else '10.0.28000.0'
+          sdk = '10.0.28000.0'
+          if expected_sdk != sdk:
+              raise SystemExit(f'Chromium expects Windows SDK {expected_sdk}, '
+                               f'but ZIP contains {sdk}.')
 
-          incs = sorted(p for p in root.glob('**/VC/Tools/MSVC/*/include')
-                        if p.is_dir())
-          sdkincs = sorted(p for p in root.glob(f'**/Include/{version}')
-                           if p.is_dir() and (p/'um').is_dir() and (p/'ucrt').is_dir())
-          if not incs or not sdkincs:
-              raise SystemExit('Missing VC/Tools/MSVC/*/include or Windows SDK Include/10.0.28000.0')
+          root = view
+          vs_version = (root / 'VS_VERSION').read_text().strip()
+          if vs_version != '2026':
+              raise SystemExit(f'Unexpected VS_VERSION={vs_version!r}')
 
-          vc_inc, sdk_inc = incs[-1], sdkincs[-1]
-          vc_root = vc_inc.parent
-          vs_root = vc_inc.parents[4]
-          sdk_root = sdk_inc.parents[1]
-          vcbin = vc_root/'bin/Hostx64/x64'
-          sdkbin = sdk_root/'bin'/version/'x64'
-          include = [vc_inc, sdk_inc/'ucrt', sdk_inc/'shared', sdk_inc/'um', sdk_inc/'winrt', sdk_inc/'cppwinrt']
-          libs = [vc_root/'lib/x64', sdk_root/'Lib'/version/'ucrt/x64', sdk_root/'Lib'/version/'um/x64']
-          if not all(p.is_dir() for p in include[:4] + libs):
-              raise SystemExit('ZIP missing required MSVC/SDK headers or libraries')
-          if not vcbin.is_dir():
-              raise SystemExit(f'Missing VC Hostx64 tools in {vcbin}')
-          redist = sorted(p for p in vs_root.glob('VC/Redist/MSVC/*/x64/*CRT') if p.is_dir())
-          if not redist:
-              raise SystemExit('Missing VC/Redist/MSVC/*/x64/*CRT runtime in toolchain ZIP')
-          runtime = redist[-1]
-          env = {
-              'VSINSTALLDIR': [[str(vs_root)]],
-              'PATH': [[str(p)] for p in (vcbin, sdkbin) if p.is_dir()],
-              'INCLUDE': [[str(p)] for p in include if p.is_dir()],
-              'LIB': [[str(p)] for p in libs],
-              'LIBPATH': [[str(p)] for p in libs],
-          }
-          setenv = sdk_root/'bin/SetEnv.x64.json'
-          setenv.parent.mkdir(parents=True, exist_ok=True)
-          setenv.write_text(json.dumps({'env': env}, indent=2))
+          incs = sorted((root / 'VC/Tools/MSVC').glob('*/include'))
+          sdkroot = root / 'Windows Kits/10'
+          sdkinc = sdkroot / 'Include' / sdk
+          if not incs or not (sdkinc / 'um').is_dir() or not (sdkinc / 'ucrt').is_dir():
+              raise SystemExit('Toolchain ZIP missing VC headers or SDK Include/10.0.28000.0')
+
+          vc_root = incs[-1].parent
+          vc_bin = vc_root / 'bin/HostX64/x64'
+          required = [
+              vc_bin / 'cl.exe',
+              vc_root / 'lib/x64',
+              sdkroot / 'Lib' / sdk / 'um/x64',
+              sdkroot / 'Lib' / sdk / 'ucrt/x64',
+              sdkroot / 'bin/SetEnv.x64.json',
+          ]
+          for p in required:
+              if not p.exists():
+                  raise SystemExit(f'Missing toolchain component: {p}')
+
+          # Windows packager already generated these relative path lists.
+          # Normalize backslash tokens for Linux os.path.join(), preserving
+          # all original INCLUDE/LIB/PATH entries.
+          original = backing / 'Windows Kits/10/bin/SetEnv.x64.json'
+          data = json.loads(original.read_text())
+          env = data['env']
+          for key, groups in env.items():
+              env[key] = [[part.replace('\\', '/') for part in parts]
+                          for parts in groups]
+          original.write_text(json.dumps(data, indent=2))
+
+          def runtime(d):
+              p = root / d
+              return str(p) if p.is_dir() else 'Arm64Unused'
+
           config = {
-              'path': str(vs_root), 'version': '2026',
-              'win_sdk': str(sdk_root), 'wdk': '',
-              'runtime_dirs': [str(runtime), str(runtime), str(runtime)],
+              'path': str(root),
+              'version': vs_version,
+              'win_sdk': str(sdkroot),
+              'wdk': '',
+              'runtime_dirs': [runtime('sys64'), runtime('sys32'),
+                               runtime('sysarm64')],
           }
-          (src/'build/win_toolchain.json').write_text(json.dumps(config, indent=2))
-          print('VS root:', vs_root)
-          print('SDK root:', sdk_root)
-          print('SDK:', version)
-          print('MSVC:', vc_root.name)
+          result = src / 'build/win_toolchain.json'
+          result.write_text(json.dumps(config, indent=2))
+          print('VS:', vs_version, 'MSVC:', vc_root.name)
+          print('SDK:', sdkroot, 'version:', sdk)
+          print('SetEnv:', original)
+          print('Chromium configuration:', result)
           PY
             touch "$WORK/.win-toolchain-ready"
+            # A successful extraction no longer needs a second ZIP copy in R2.
+            rm -f "$CACHE/package.zip" "$CACHE/package.part"
           fi
           test -f "$SRC/build/win_toolchain.json"
-          test -f "$WORK/.win-toolchain-ready"
+          test -f "$VIEW/Windows Kits/10/bin/SetEnv.x64.json"
           python3 "$SRC/build/vs_toolchain.py" get_toolchain_dir
 
       - name: Run Chromium gclient hooks
