@@ -1,25 +1,74 @@
-name: Cross-Build Chromium Win on Linux
+name: Cross-Build Chromium Windows R2 Resume
 
 on:
   workflow_dispatch:
+    inputs:
+      auto_resume:
+        description: Start another pass after checkpoint
+        type: boolean
+        default: false
+      pass:
+        description: Current pass
+        default: "1"
+        type: string
+      max_passes:
+        description: Maximum automatic passes
+        default: "12"
+        type: string
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: chromium-win155-r2-v2
+  cancel-in-progress: false
 
 jobs:
-  build-win-on-linux:
-    runs-on: ubuntu-latest # Hoặc self-hosted linux
-    
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+
+    env:
+      CHROMIUM_VERSION: "155.0.8059.79"
+      WORK: /mnt/chromium-ci/work
+      IMAGE: /home/runner/work/chromium-ci.img
+      IMAGE_GIB: "220"
+      BTRFS_ZSTD: "1"
+      MIN_FREE_GIB: "12"
+      BUILD_JOBS: "2"
+      DEPOT_TOOLS_WIN_TOOLCHAIN: "1"
+
+      TOOLCHAIN_URL: >-
+        https://pub-8f1f5b85dfa3490cb6526249c67b4237.r2.dev/chromium-win-toolchain-vs2026-sdk28000.zip
+
+      TOOLCHAIN_SHA256: ${{ vars.TOOLCHAIN_SHA256 }}
+
+      R2_BUCKET: ${{ vars.R2_BUCKET }}
+      R2_ROOT: r2:${{ vars.R2_BUCKET }}/chromium-win155-v2
+
+      RCLONE_CONFIG_R2_TYPE: s3
+      RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+      RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      RCLONE_CONFIG_R2_REGION: auto
+
     steps:
-      - name: Reclaim root disk
+      - name: Reclaim disk and install tools
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+
+          echo "RUN_START=$(date +%s)" >> "$GITHUB_ENV"
+
           sudo swapoff -a || true
-          sudo rm -f /swapfile /build-swap /mnt/swapfile || true
-          sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null || true
+          sudo systemctl stop docker.service docker.socket \
+            containerd.service 2>/dev/null || true
 
           sudo rm -rf \
             /var/lib/docker \
             /var/lib/containerd \
-            /var/cache/apt/archives/* \
             /usr/local/lib/android \
             /usr/share/dotnet \
             /opt/ghc \
@@ -30,47 +79,658 @@ jobs:
             /usr/local/share/powershell \
             /usr/local/lib/node_modules \
             /usr/local/graalvm \
-            /usr/share/rust \
-            /usr/share/php* \
-            /usr/local/share/chromium \
             /usr/share/miniconda \
-            /usr/local/aws-cli \
-            /usr/local/aws-sam-cli \
             /usr/local/share/vcpkg \
             /opt/google \
-            /opt/microsoft \
-            /usr/share/postgresql \
-            /usr/share/mysql \
-            /usr/local/julia* || true
-      - name: Setup Depot Tools
-        run: |
-          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
-          echo "$GITHUB_WORKSPACE/depot_tools" >> $GITHUB_PATH
+            /opt/microsoft || true
 
-      - name: Download Custom Windows Toolchain
-        run: |
-          # Tải file zip toolchain bạn đã đóng gói ở Bước 1
-          wget -O win_toolchain.zip "https://pub-8f1f5b85dfa3490cb6526249c67b4237.r2.dev/chromium-win-toolchain-vs2026-sdk28000.zip"
-          unzip win_toolchain.zip -d $GITHUB_WORKSPACE/win_toolchain
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive \
+            apt-get install -y --no-install-recommends \
+            btrfs-progs ciopfs fuse3 \
+            rclone zstd unzip jq git git-lfs ninja-build
 
-      - name: Fetch Chromium Source
-        run: |
-          mkdir chromium_build && cd chromium_build
-          fetch --nohooks chromium
-          cd src
-          git checkout 155.0.8059.79
-          
-          # Tắt tải toolchain mặc định của Google
-          export DEPOT_TOOLS_WIN_TOOLCHAIN=0
-          gclient sync --with_branch_heads --with_tags -D
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
 
-      - name: Generate Build Files
-        run: |
-          cd chromium_build/src
-          # Cấu hình GN để chỉ đường dẫn tới toolchain custom của bạn
-          gn gen out/Default --args='target_os="win" target_cpu="x64" is_debug=false is_component_build=false symbol_level=0 custom_toolchain="//build/toolchain/win:win_clang_x64" visual_studio_path="/home/runner/work/your-repo/your-repo/win_toolchain"'
+          # Reusable telemetry for every following step.
+          cat > "$GITHUB_WORKSPACE/ci-metrics.sh" <<'SH'
+          ci_metrics() {
+            echo ""
+            echo "====== CI RESOURCE REPORT ======"
+            echo "Time: $(date -u +%FT%TZ)"
+            echo "CPU: $(nproc)"
+            echo "--- RAM / Swap ---"
+            free -h || true
+            echo "--- Host filesystem ---"
+            df -h / || true
+            echo "--- Host bytes available ---"
+            df -PB1 / || true
+            if mountpoint -q /mnt/chromium-ci; then
+              echo "--- Btrfs logical capacity ---"
+              df -h /mnt/chromium-ci || true
+              echo "--- Btrfs allocation ---"
+              sudo btrfs filesystem usage \
+                /mnt/chromium-ci || true
+            fi
+            if [ -f "$IMAGE" ]; then
+              echo "--- Sparse image physical usage ---"
+              du -h "$IMAGE" || true
+            fi
+            echo "================================"
+          }
 
-      - name: Build Chromium
+          ci_begin() {
+            echo "=== STEP: $1 ==="
+            ci_metrics
+            trap 'ci_metrics' EXIT
+          }
+          SH
+
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin "Reclaim and dependencies"
+
+          rclone version
+          zstd --version
+          df -h /
+
+      - name: Create Btrfs ZSTD1 workspace
+        shell: bash
         run: |
-          cd chromium_build/src
-          autoninja -C out/Default chrome
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin "Create Btrfs"
+
+          sudo mkdir -p /mnt/chromium-ci
+          sudo truncate -s "${IMAGE_GIB}G" "$IMAGE"
+          sudo mkfs.btrfs -f -q "$IMAGE"
+
+          sudo mount \
+            -o loop,compress=zstd:1,discard=async \
+            "$IMAGE" /mnt/chromium-ci
+
+          sudo chown "$USER:$USER" /mnt/chromium-ci
+          mkdir -p "$WORK"
+
+          findmnt /mnt/chromium-ci
+
+      - name: Configure R2 and restore incremental layers
+        id: restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin "R2 restore"
+
+          test -n "$R2_BUCKET"
+          test -n "$RCLONE_CONFIG_R2_ACCESS_KEY_ID"
+          test -n "$RCLONE_CONFIG_R2_SECRET_ACCESS_KEY"
+
+          # Confirm bucket access.
+          rclone lsf "r2:$R2_BUCKET" >/dev/null
+
+          LAST=0
+          if rclone cat "$R2_ROOT/latest.txt" \
+            > "$RUNNER_TEMP/latest.txt" 2>/dev/null; then
+            LAST="$(cat "$RUNNER_TEMP/latest.txt")"
+          fi
+
+          [[ "$LAST" =~ ^[0-9]+$ ]] || {
+            echo "Invalid checkpoint pointer: $LAST"
+            exit 1
+          }
+
+          echo "Latest committed checkpoint: $LAST"
+
+          if (( LAST > 0 )); then
+            for N in $(seq 1 "$LAST"); do
+              echo "=== Restoring layer $N/$LAST ==="
+
+              rclone cat \
+                "$R2_ROOT/layers/$N.tar.zst" \
+                --s3-download-concurrency 4 \
+              | zstd -d -T2 -c \
+              | tar --extract \
+                  --listed-incremental=/dev/null \
+                  --no-same-owner \
+                  --no-same-permissions \
+                  -C "$WORK" -f -
+            done
+
+            rclone copyto \
+              "$R2_ROOT/state/$LAST.snar" \
+              "$RUNNER_TEMP/previous.snar"
+          fi
+
+          echo "RESTORED_LAST=$LAST" >> "$GITHUB_ENV"
+          echo "checkpoint=$LAST" >> "$GITHUB_OUTPUT"
+
+      - name: Setup depot_tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin "Depot tools"
+
+          if [ ! -d "$WORK/depot_tools/.git" ]; then
+            git clone --depth 1 \
+              https://chromium.googlesource.com/chromium/tools/depot_tools.git \
+              "$WORK/depot_tools"
+          fi
+
+          echo "$WORK/depot_tools" >> "$GITHUB_PATH"
+
+          export PATH="$WORK/depot_tools:$PATH"
+          gclient --version || true
+
+      - name: Sync Chromium source
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin "Chromium sync"
+
+          export PATH="$WORK/depot_tools:$PATH"
+          ROOT="$WORK/chromium_build"
+          SRC="$ROOT/src"
+
+          mkdir -p "$ROOT"
+
+          if [ -f "$WORK/.source-ready" ]; then
+            echo "Source already synchronized."
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Reserve 95 minutes of the job for checkpoint.
+          DEADLINE=$((RUN_START + 260 * 60))
+          LEFT=$((DEADLINE - $(date +%s)))
+
+          if (( LEFT < 300 )); then
+            echo "Source stage time budget exhausted."
+            echo "resume=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ ! -d "$SRC/.git" ]; then
+            git clone --depth 1 \
+              --branch "$CHROMIUM_VERSION" \
+              https://chromium.googlesource.com/chromium/src.git \
+              "$SRC"
+          fi
+
+          cd "$ROOT"
+
+          if [ ! -f .gclient ]; then
+            gclient config --unmanaged --name=src \
+              https://chromium.googlesource.com/chromium/src.git
+
+            printf "\ntarget_os = ['win']\n" >> .gclient
+          fi
+
+          LEFT=$((DEADLINE - $(date +%s)))
+
+          if (( LEFT < 300 )); then
+            echo "resume=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          set +e
+          timeout -s INT -k 90s "${LEFT}s" \
+            gclient sync \
+              --nohooks \
+              --no-history \
+              --jobs 4
+          RC=$?
+          set -e
+
+          if (( RC == 0 )); then
+            touch "$WORK/.source-ready"
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          elif (( RC == 124 )); then
+            echo "Sync paused by time budget."
+            echo "resume=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "gclient sync failed: $RC"
+            exit "$RC"
+          fi
+
+      - name: Prepare Windows toolchain
+        id: toolchain
+        if: steps.sync.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin "Windows hermetic toolchain"
+
+          export PATH="$WORK/depot_tools:$PATH"
+          SRC="$WORK/chromium_build/src"
+
+          RAW="$WORK/win_toolchain_backing"
+          VIEW="$WORK/win_toolchain"
+
+          mkdir -p "$RAW" "$VIEW"
+
+          # Mount a case-insensitive view.
+          if ! mountpoint -q "$VIEW"; then
+            ciopfs -o use_ino "$RAW" "$VIEW"
+          fi
+
+          mountpoint -q "$VIEW" || {
+            echo "ciopfs mount failed."
+            exit 1
+          }
+
+          if [ ! -f "$WORK/.win-toolchain-ready" ]; then
+            ZIP="$RUNNER_TEMP/toolchain.zip"
+
+            curl -fL --retry 5 --retry-delay 5 \
+              "$TOOLCHAIN_URL" -o "$ZIP"
+
+            if [ -n "${TOOLCHAIN_SHA256:-}" ]; then
+              echo "$TOOLCHAIN_SHA256  $ZIP" \
+                | sha256sum -c -
+            fi
+
+            unzip -oq "$ZIP" -d "$VIEW"
+            rm -f "$ZIP"
+
+            # Detect Visual Studio and SDK layouts inside ZIP.
+            python3 - "$VIEW" "$SRC" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          root = Path(sys.argv[1])
+          src = Path(sys.argv[2])
+          sdk_version = "10.0.28000.0"
+
+          vc_includes = sorted(
+              p for p in root.rglob("include")
+              if p.is_dir()
+              and p.parents[1].name == "MSVC"
+              and p.parents[2].name == "Tools"
+              and p.parents[3].name == "VC"
+          )
+
+          sdk_includes = sorted(
+              p for p in root.rglob(sdk_version)
+              if p.is_dir()
+              and p.parent.name == "Include"
+              and (p / "um").is_dir()
+              and (p / "ucrt").is_dir()
+          )
+
+          if not vc_includes or not sdk_includes:
+              raise SystemExit(
+                  "ZIP lacks VC/Tools/MSVC or Windows SDK "
+                  "10.0.28000.0. Inspect the ZIP layout."
+              )
+
+          vc_include = vc_includes[-1]
+          vc_version = vc_include.parent
+          vs_root = vc_include.parents[4]
+          sdk_include = sdk_includes[-1]
+          sdk_root = sdk_include.parents[1]
+
+          vc_bin = vc_version / "bin/Hostx64/x64"
+
+          if not (vc_bin / "cl.exe").is_file():
+              raise SystemExit(
+                  f"Missing compiler tools: {vc_bin}/cl.exe"
+              )
+
+          includes = [
+              vc_include,
+              sdk_include / "ucrt",
+              sdk_include / "shared",
+              sdk_include / "um",
+              sdk_include / "winrt",
+              sdk_include / "cppwinrt",
+          ]
+
+          libs = [
+              vc_version / "lib/x64",
+              sdk_root / "Lib" / sdk_version / "ucrt/x64",
+              sdk_root / "Lib" / sdk_version / "um/x64",
+          ]
+
+          includes = [p for p in includes if p.is_dir()]
+          libs = [p for p in libs if p.is_dir()]
+
+          if len(includes) < 4 or len(libs) < 3:
+              raise SystemExit(
+                  "Incomplete MSVC headers or SDK libraries."
+              )
+
+          sdk_bin = sdk_root / "bin" / sdk_version / "x64"
+          path_entries = [
+              vc_bin,
+              sdk_bin,
+              sdk_root / "bin/x64",
+          ]
+          path_entries = [
+              p for p in path_entries if p.is_dir()
+          ]
+
+          # All entries are absolute Linux paths. The
+          # Chromium setup script accepts these in its JSON.
+          data = {
+              "env": {
+                  "VSINSTALLDIR": [[str(vs_root)]],
+                  "PATH": [[str(p)] for p in path_entries],
+                  "INCLUDE": [[str(p)] for p in includes],
+                  "LIB": [[str(p)] for p in libs],
+                  "LIBPATH": [[str(p)] for p in libs],
+              }
+          }
+
+          sdk_env = sdk_root / "bin/SetEnv.x64.json"
+          sdk_env.parent.mkdir(parents=True, exist_ok=True)
+          sdk_env.write_text(json.dumps(data, indent=2))
+
+          redist = sorted(
+              p for p in vs_root.glob(
+                  "VC/Redist/MSVC/*/x64/*CRT"
+              ) if p.is_dir()
+          )
+
+          x64_runtime = redist[-1] if redist else vs_root
+
+          toolchain = {
+              "path": str(vs_root),
+              "version": "2026",
+              "win_sdk": str(sdk_root),
+              "wdk": "",
+              "runtime_dirs": [
+                  str(x64_runtime),
+                  str(x64_runtime),
+                  str(x64_runtime),
+              ],
+          }
+
+          output = src / "build/win_toolchain.json"
+          output.write_text(json.dumps(toolchain, indent=2))
+
+          print("VS path:", vs_root)
+          print("SDK path:", sdk_root)
+          print("MSVC:", vc_version.name)
+          print("SDK version:", sdk_version)
+          print("Environment:", sdk_env)
+          PY
+
+            touch "$WORK/.win-toolchain-ready"
+          fi
+
+          test -f "$SRC/build/win_toolchain.json"
+
+          # Chromium automatically loads the hermetic config.
+          python3 "$SRC/build/vs_toolchain.py" \
+            get_toolchain_dir
+
+      - name: Run Chromium hooks
+        id: hooks
+        if: steps.toolchain.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin "Chromium hooks"
+
+          export PATH="$WORK/depot_tools:$PATH"
+
+          if [ -f "$WORK/.hooks-ready" ]; then
+            echo "Hooks restored."
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          DEADLINE=$((RUN_START + 260 * 60))
+          LEFT=$((DEADLINE - $(date +%s)))
+
+          if (( LEFT < 300 )); then
+            echo "resume=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          cd "$WORK/chromium_build"
+
+          # Skip Google's internal VS package download.
+          # The local hermetic JSON is already installed.
+          set +e
+          DEPOT_TOOLS_WIN_TOOLCHAIN=0 \
+            timeout -s INT -k 90s "${LEFT}s" \
+            gclient runhooks
+          RC=$?
+          set -e
+
+          if (( RC == 0 )); then
+            touch "$WORK/.hooks-ready"
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          elif (( RC == 124 )); then
+            echo "resume=true" >> "$GITHUB_OUTPUT"
+          else
+            exit "$RC"
+          fi
+
+      - name: Generate GN Windows build files
+        id: gn
+        if: steps.hooks.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin "GN generation"
+
+          export PATH="$WORK/depot_tools:$PATH"
+          cd "$WORK/chromium_build/src"
+
+          mkdir -p out/Default
+
+          cat > out/Default/args.gn <<'GN'
+          target_os = "win"
+          target_cpu = "x64"
+          is_debug = false
+          is_component_build = false
+          is_official_build = false
+          is_clang = true
+          symbol_level = 0
+          blink_symbol_level = 0
+          GN
+
+          # Do not set visual_studio_path here.
+          # The JSON configuration supplies the VS/SDK data.
+          DEPOT_TOOLS_WIN_TOOLCHAIN=1 \
+            gn gen out/Default
+
+          test -f out/Default/build.ninja
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Incremental Ninja build
+        id: build
+        if: steps.gn.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin "Ninja build"
+
+          export PATH="$WORK/depot_tools:$PATH"
+          cd "$WORK/chromium_build/src"
+
+          DEADLINE=$((RUN_START + 260 * 60))
+          LEFT=$((DEADLINE - $(date +%s)))
+
+          if (( LEFT < 300 )); then
+            echo "resume=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Ninja time budget: ${LEFT}s"
+
+          # Capture Ninja output while monitoring physical free space.
+          set +e
+          timeout -s INT -k 120s "${LEFT}s" \
+            ninja -C out/Default \
+              -j "$BUILD_JOBS" chrome \
+            > "$WORK/ninja-build.log" 2>&1 &
+          PID=$!
+          DISK_STOP=0
+
+          while kill -0 "$PID" 2>/dev/null; do
+            sleep 45
+            tail -n 8 "$WORK/ninja-build.log" || true
+
+            FREE_KIB="$(df -Pk / | awk 'NR==2 {print $4}')"
+            MIN_KIB=$((MIN_FREE_GIB * 1024 * 1024))
+
+            if (( FREE_KIB < MIN_KIB )); then
+              echo "Low physical disk: stopping Ninja."
+              DISK_STOP=1
+              kill -INT "$PID" || true
+              break
+            fi
+          done
+
+          wait "$PID"
+          RC=$?
+          set -e
+
+          if (( RC == 0 )); then
+            test -f out/Default/chrome.exe
+            touch "$WORK/.build-complete"
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+          elif (( RC == 124 || DISK_STOP == 1 )); then
+            echo "Ninja paused. Checkpoint required."
+            echo "resume=true" >> "$GITHUB_OUTPUT"
+          else
+            tail -n 100 "$WORK/ninja-build.log" || true
+            echo "Ninja failed with exit code $RC"
+            exit "$RC"
+          fi
+
+      - name: Upload incremental checkpoint to R2
+        id: checkpoint
+        if: >-
+          ${{
+            always() &&
+            steps.restore.outcome == 'success'
+          }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin "Incremental checkpoint"
+
+          PREV="${RESTORED_LAST:-0}"
+          NEXT=$((PREV + 1))
+          NEW_STATE="$RUNNER_TEMP/new.snar"
+
+          # Never modify the last committed snapshot state.
+          if (( PREV > 0 )); then
+            cp "$RUNNER_TEMP/previous.snar" "$NEW_STATE"
+          fi
+
+          echo "Creating incremental layer $NEXT"
+
+          # Btrfs image itself is not backed up.
+          # ciopfs backing data is, but its FUSE view is not.
+          # Stream directly to R2: no huge local tar file.
+          tar \
+            --create \
+            --no-check-device \
+            --one-file-system \
+            --listed-incremental="$NEW_STATE" \
+            --exclude='./win_toolchain' \
+            -C "$WORK" \
+            -f - . \
+          | zstd -1 -T2 -c \
+          | rclone rcat \
+              "$R2_ROOT/layers/$NEXT.tar.zst" \
+              --s3-chunk-size 32M \
+              --s3-upload-concurrency 2 \
+              --stats 60s \
+              --stats-one-line
+
+          # Upload updated GNU tar snapshot metadata.
+          rclone copyto "$NEW_STATE" \
+            "$R2_ROOT/state/$NEXT.snar"
+
+          # Commit point. Older layers remain untouched.
+          printf '%s' "$NEXT" \
+            | rclone rcat "$R2_ROOT/latest.txt"
+
+          echo "committed=true" >> "$GITHUB_OUTPUT"
+          echo "layer=$NEXT" >> "$GITHUB_OUTPUT"
+
+          echo "Committed checkpoint layer $NEXT"
+
+      - name: Dispatch next pass
+        if: >-
+          ${{
+            inputs.auto_resume &&
+            steps.checkpoint.outputs.committed == 'true' &&
+            (
+              steps.sync.outputs.resume == 'true' ||
+              steps.hooks.outputs.resume == 'true' ||
+              steps.build.outputs.resume == 'true'
+            )
+          }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_PASS: ${{ inputs.pass }}
+          MAX_PASSES: ${{ inputs.max_passes }}
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin "Dispatch next pass"
+
+          CURRENT="${CURRENT_PASS:-1}"
+          MAX="${MAX_PASSES:-12}"
+
+          [[ "$CURRENT" =~ ^[0-9]+$ ]]
+          [[ "$MAX" =~ ^[0-9]+$ ]]
+
+          if (( CURRENT >= MAX )); then
+            echo "Maximum passes reached."
+            exit 0
+          fi
+
+          NEXT=$((CURRENT + 1))
+
+          gh api -X POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/chromium-win-linux.yml/dispatches" \
+            -f "ref=${GITHUB_REF_NAME}" \
+            -f "inputs[pass]=$NEXT" \
+            -f "inputs[max_passes]=$MAX" \
+            -f "inputs[auto_resume]=true"
+
+      - name: Build summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin "Final summary"
+
+          {
+            echo "## Chromium Windows build"
+            echo ""
+            echo "- Version: $CHROMIUM_VERSION"
+            echo "- Btrfs logical: ${IMAGE_GIB} GiB"
+            echo "- Btrfs compression: zstd:${BTRFS_ZSTD}"
+            echo "- Checkpoint store: Cloudflare R2"
+            echo "- Previous checkpoint: ${RESTORED_LAST:-0}"
+            echo "- Build completed: ${{ steps.build.outputs.completed || 'false' }}"
+            echo "- Checkpoint committed: ${{ steps.checkpoint.outputs.committed || 'false' }}"
+            echo ""
+            echo "### Host resources"
+            echo '```'
+            df -h /
+            free -h
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
