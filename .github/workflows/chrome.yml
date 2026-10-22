@@ -208,7 +208,7 @@ jobs:
           rclone deletefile "$PROBE" || true
           echo 'R2 upload preflight=PASS'
 
-      - name: Restore committed checkpoint from R2
+      - name: Restore committed checkpoint from R2 (export-safe overlay)
         id: restore
         shell: bash
         run: |
@@ -239,6 +239,28 @@ jobs:
           fi
           echo "Committed checkpoint: $LAST"
 
+          # GNU tar incremental extraction may infer directory renames from
+          # inode records across snapshots and fail with 'Directory not empty'.
+          # Export-only requires the compiled outputs, not an exact filesystem
+          # mirror for continuing Ninja. Overlay extraction deliberately skips
+          # GNU incremental directory renames/deletions while applying file data
+          # in chronological order. Do NOT use this mode for build/resume.
+          TAR_RESTORE_ARGS=(
+            --extract --xattrs '--xattrs-include=user.*'
+            --no-same-owner --no-same-permissions
+          )
+          if [[ '${{ inputs.export_only }}' == 'true' ]]; then
+            TAR_RESTORE_ARGS+=(--no-overwrite-dir)
+            echo 'Restore mode: export-only overlay (no incremental rename/purge)'
+            if (( LAST == 0 )); then
+              echo '::error::export_only requested but R2 has no committed checkpoint'
+              exit 1
+            fi
+          else
+            TAR_RESTORE_ARGS+=(--listed-incremental=/dev/null)
+            echo 'Restore mode: exact GNU tar incremental for Ninja resume'
+          fi
+
           if (( LAST > 0 )); then
             for N in $(seq 1 "$LAST"); do
               echo "=== Restoring layer $N/$LAST ==="
@@ -250,10 +272,8 @@ jobs:
                 MANIFEST="$RUNNER_TEMP/r2-manifest-$N.json"
                 rclone copyto "$R2_ROOT/layers/$N/manifest.json" "$MANIFEST" --retries 5
                 python3 - "$R2_ROOT/layers/$N" "$MANIFEST" "$RUNNER_TEMP" <<'PYRESTORE' \
-                  | zstd -d -T2 -c \
-                  | tar -x --listed-incremental=/dev/null \
-                      --xattrs --xattrs-include='user.*' \
-                      --no-same-owner --no-same-permissions -C "$WORK" -f -
+                  | zstd -d -c \
+                  | tar "${TAR_RESTORE_ARGS[@]}" -C "$WORK" -f -
           import hashlib
           import json
           import re
@@ -320,10 +340,8 @@ jobs:
                 HASH_RELAY=$'import hashlib,sys\nh=hashlib.sha256(); i=sys.stdin.buffer; o=sys.stdout.buffer\nwhile True:\n b=i.read(8*1024*1024)\n if not b: break\n h.update(b); o.write(b); o.flush()\nopen(sys.argv[1],"w").write(h.hexdigest()+"\\n")'
                 rclone cat "$R2_ROOT/layers/$N.tar.zst" --stats 30s --stats-one-line \
                   | python3 -c "$HASH_RELAY" "$RECEIVED_HASH" \
-                  | zstd -d -T2 -c \
-                  | tar -x --listed-incremental=/dev/null \
-                      --xattrs --xattrs-include='user.*' \
-                      --no-same-owner --no-same-permissions -C "$WORK" -f -
+                  | zstd -d -c \
+                  | tar "${TAR_RESTORE_ARGS[@]}" -C "$WORK" -f -
                 if (( HAS_SHA )); then
                   cmp -s "$EXPECTED_HASH" "$RECEIVED_HASH" || {
                     echo "::error::Checkpoint $N compressed SHA256 mismatch"
@@ -332,8 +350,26 @@ jobs:
                 fi
               fi
             done
-            rclone copyto "$R2_ROOT/state/$LAST.snar" "$RUNNER_TEMP/previous.snar" --retries 5
-            test -s "$RUNNER_TEMP/previous.snar"
+            if [[ '${{ inputs.export_only }}' == 'true' ]]; then
+              echo '=== Verify exported build after overlay restore ==='
+              test -s "$WORK/chromium_build/src/out/Default/chrome.exe" || {
+                echo '::error::Restored layers do not contain chrome.exe'
+                exit 1
+              }
+              test -f "$WORK/.build-complete" || {
+                echo '::error::Missing build-complete marker in restored layers'
+                exit 1
+              }
+              echo 'chrome.exe and build-complete marker verified.'
+              echo 'Note: export overlay is not suitable for resuming Ninja.'
+            fi
+            if [[ '${{ inputs.export_only }}' != 'true' ]]; then
+              # A resumed build needs the GNU tar metadata for its next backup.
+              rclone copyto "$R2_ROOT/state/$LAST.snar" "$RUNNER_TEMP/previous.snar" --retries 5
+              test -s "$RUNNER_TEMP/previous.snar"
+            else
+              echo 'Skipping .snar download: export_only will not create new layers.'
+            fi
           fi
           mkdir -p "$WORK"
           echo "RESTORED_LAST=$LAST" >> "$GITHUB_ENV"
@@ -1248,6 +1284,7 @@ jobs:
             echo "- Committed layer: ${{ steps.checkpoint.outputs.layer || 'none' }}"
             echo "- Build completed: ${{ steps.build.outputs.completed || 'false' }}"
             echo "- Export-only: ${{ inputs.export_only || 'false' }}"
+            echo "- Restore strategy: ${{ inputs.export_only && 'overlay (export recovery)' || 'incremental (Ninja resume)' }}"
             echo "- Export ready: ${{ steps.export.outputs.ready || 'false' }}"
             echo "- Release objects: ${{ steps.export_r2.outputs.release_path || 'none' }}"
             echo '```'
