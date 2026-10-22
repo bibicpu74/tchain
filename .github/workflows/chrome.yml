@@ -15,6 +15,10 @@ on:
         description: Maximum automatic passes
         type: string
         default: '12'
+      export_only:
+        description: Restore the completed R2 checkpoint and export built Windows files (no rebuild)
+        type: boolean
+        default: false
       r2_upload_mode:
         description: R2 upload mode (LineageOS-proven stream, or chunked fallback)
         type: choice
@@ -91,7 +95,7 @@ jobs:
           sudo apt-get clean || true
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            btrfs-progs ciopfs fuse3 zstd unzip jq git git-lfs ninja-build
+            btrfs-progs ciopfs fuse3 zstd unzip zip jq git git-lfs ninja-build
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
 
@@ -166,6 +170,7 @@ jobs:
           findmnt /mnt/chromium-ci
 
       - name: Preflight R2 upload method before Chromium build
+        if: ${{ !inputs.export_only }}
         shell: bash
         run: |
           set -euo pipefail
@@ -336,6 +341,7 @@ jobs:
           echo "R2 restore complete at layer $LAST"
 
       - name: Set up depot_tools
+        if: ${{ !inputs.export_only }}
         shell: bash
         run: |
           set -euo pipefail
@@ -350,6 +356,7 @@ jobs:
 
       - name: Fetch or resume Chromium sources
         id: sync
+        if: ${{ !inputs.export_only }}
         shell: bash
         run: |
           set -euo pipefail
@@ -831,7 +838,7 @@ jobs:
 
       - name: Upload verified incremental checkpoint to R2
         id: checkpoint
-        if: ${{ always() && steps.restore.outcome == 'success' }}
+        if: ${{ !inputs.export_only && always() && steps.restore.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -969,10 +976,207 @@ jobs:
           echo "layer=$NEXT" >> "$GITHUB_OUTPUT"
           echo "Checkpoint $NEXT committed and verified (mode=$R2_UPLOAD_MODE)."
 
+      # This step also works on a new runner after a completed build:
+      # export_only=true restores R2 layers, then skips depot_tools, GN and Ninja.
+      - name: Package Windows runtime and compiled libraries
+        id: export
+        if: ${{ steps.restore.outcome == 'success' && (inputs.export_only || steps.build.outputs.completed == 'true') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin 'Package Chromium Windows artifacts'
+          OUT="$WORK/chromium_build/src/out/Default"
+          DIST="$GITHUB_WORKSPACE/chromium-export"
+          test -s "$OUT/chrome.exe" || {
+            echo '::error::Missing out/Default/chrome.exe in restored workspace'
+            exit 1
+          }
+          test -f "$WORK/.build-complete" || {
+            echo '::error::Checkpoint is not marked as a completed Chromium build'
+            exit 1
+          }
+          mkdir -p "$DIST"
+          echo '=== Check restored release outputs ==='
+          ls -lh "$OUT/chrome.exe" "$OUT"/*.dll 2>/dev/null | head -60 || true
+          echo '=== Stage runtime (exclude obj/gen and intermediate files) ==='
+
+          python3 - "$OUT" "$DIST" "$CHROMIUM_VERSION" <<'PYEXPORT'
+          from pathlib import Path
+          import json
+          import os
+          import shutil
+          import sys
+
+          out, dist, version = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+          runtime = dist / 'runtime' / 'chrome-win-x64'
+          runtime.mkdir(parents=True, exist_ok=True)
+          extensions = {'.exe', '.dll', '.pak', '.dat', '.bin', '.json',
+                        '.manifest', '.png', '.ico', '.sig', '.xml'}
+          special = {'First Run', 'LICENSE', 'README'}
+          directories = {
+              'locales', 'Locales', 'swiftshader', 'MEIPreload', 'Extensions',
+              'VisualElements', 'WidevineCdm', 'PrivacySandboxAttestationsPreloaded',
+              'resources', 'PKIMetadata', 'hyphen-data', 'screen_ai',
+          }
+          selected_files = []
+          for child in sorted(out.iterdir(), key=lambda p: p.name.lower()):
+              if child.is_file() and (child.suffix.lower() in extensions or
+                                      child.name in special):
+                  shutil.copy2(child, runtime / child.name)
+                  selected_files.append(child.name)
+              elif child.is_dir() and child.name in directories:
+                  shutil.copytree(child, runtime / child.name,
+                                  dirs_exist_ok=True, symlinks=False)
+          if not (runtime / 'chrome.exe').is_file():
+              raise SystemExit('Runtime package missing chrome.exe')
+          (runtime / 'BUILD_INFO.txt').write_text(
+              'Chromium ' + version + ' Windows x64\n'
+              'Built with Chromium GN/Ninja (is_component_build=false, '
+              'is_debug=false, symbol_level=0).\n'
+              'This is an unpacked development build, NOT an installer.\n'
+              'Windows execution has not been validated in this workflow.\n',
+              encoding='utf-8')
+          lib_paths = sorted(
+              (p.relative_to(out) for p in out.rglob('*.lib') if p.is_file()),
+              key=lambda p: p.as_posix())
+          (dist / 'libs-filelist.nul').write_bytes(
+              b''.join(os.fsencode(str(p)) + b'\0' for p in lib_paths))
+          info = {
+              'chromium_version': version,
+              'target_os': 'win', 'target_cpu': 'x64',
+              'runtime_files_at_root': selected_files,
+              'libraries_count': len(lib_paths),
+              'source': 'restored Chromium Ninja output',
+          }
+          (dist / 'manifest.json').write_text(
+              json.dumps(info, indent=2, ensure_ascii=False) + '\n',
+              encoding='utf-8')
+          print(f'Runtime root files: {len(selected_files)}')
+          print(f'Windows .lib files: {len(lib_paths)}')
+          print('Runtime stage:', runtime)
+          PYEXPORT
+
+          RELEASE="chromium-${CHROMIUM_VERSION}-win-x64"
+          RUNTIME_ZIP="$DIST/${RELEASE}-runtime.zip"
+          (
+            cd "$DIST/runtime"
+            zip -q -r -1 "$RUNTIME_ZIP" chrome-win-x64
+          )
+          unzip -tq "$RUNTIME_ZIP" | tail -3
+          echo '=== Package compiled .lib files separately ==='
+          LIBS_ZST="$DIST/${RELEASE}-libs.tar.zst"
+          if [ -s "$DIST/libs-filelist.nul" ]; then
+            tar -C "$OUT" --null -T "$DIST/libs-filelist.nul" -cf - \
+              | zstd -1 -T2 -o "$LIBS_ZST"
+            zstd -t "$LIBS_ZST"
+          else
+            echo 'No compiled .lib files found; skipping libraries archive.'
+          fi
+
+          (
+            cd "$DIST"
+            sha256sum "$(basename "$RUNTIME_ZIP")" > "$(basename "$RUNTIME_ZIP").sha256"
+            if [ -s "$LIBS_ZST" ]; then
+              sha256sum "$(basename "$LIBS_ZST")" > "$(basename "$LIBS_ZST").sha256"
+            fi
+          )
+          echo '=== Export archive sizes ==='
+          ls -lh "$DIST"/*.zip "$DIST"/*.zst "$DIST"/*.sha256 "$DIST/manifest.json" 2>/dev/null || true
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          echo "runtime_zip=$RUNTIME_ZIP" >> "$GITHUB_OUTPUT"
+          echo "runtime_sha=$RUNTIME_ZIP.sha256" >> "$GITHUB_OUTPUT"
+          echo "manifest=$DIST/manifest.json" >> "$GITHUB_OUTPUT"
+          if [ -s "$LIBS_ZST" ]; then
+            echo "libs_zst=$LIBS_ZST" >> "$GITHUB_OUTPUT"
+            echo "libs_sha=$LIBS_ZST.sha256" >> "$GITHUB_OUTPUT"
+            # Keep GitHub artifacts comfortably below the single-artifact cap.
+            if (( $(stat -c %s "$LIBS_ZST") <= 8 * 1024 * 1024 * 1024 )); then
+              echo 'libs_github_ready=true' >> "$GITHUB_OUTPUT"
+            else
+              echo 'libs_github_ready=false' >> "$GITHUB_OUTPUT"
+              echo '::warning::Libraries exceed 8 GiB; publishing them to R2 only.'
+            fi
+          fi
+
+      - name: Upload completed Windows files to Cloudflare R2
+        id: export_r2
+        if: ${{ always() && steps.export.outputs.ready == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin 'Upload built Chromium files to R2'
+          DIST="$GITHUB_WORKSPACE/chromium-export"
+          RELEASE_PATH="$R2_ROOT/exports/${CHROMIUM_VERSION}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          echo "Release location: $RELEASE_PATH"
+          upload_verified() {
+            local local_file="$1"
+            local remote_file="$RELEASE_PATH/$(basename "$local_file")"
+            test -s "$local_file"
+            rclone copyto "$local_file" "$remote_file" \
+              --s3-upload-cutoff 64M \
+              --s3-chunk-size 64M \
+              --s3-upload-concurrency 4 \
+              --retries 5 --low-level-retries 10 \
+              --stats 30s --stats-one-line
+            local expected actual
+            expected="$(stat -c %s "$local_file")"
+            actual="$(rclone size "$remote_file" --json | jq -r '.bytes')"
+            if [ "$expected" != "$actual" ]; then
+              echo "::error::R2 export size mismatch $(basename "$local_file"): $expected != $actual"
+              return 1
+            fi
+            echo "Verified R2 object: $(basename "$local_file") ($actual bytes)"
+          }
+          upload_verified "${{ steps.export.outputs.runtime_zip }}"
+          upload_verified "${{ steps.export.outputs.runtime_sha }}"
+          if [ -n "${{ steps.export.outputs.libs_zst }}" ]; then
+            upload_verified "${{ steps.export.outputs.libs_zst }}"
+            upload_verified "${{ steps.export.outputs.libs_sha }}"
+          fi
+          upload_verified "${{ steps.export.outputs.manifest }}"
+          echo "release_path=$RELEASE_PATH" >> "$GITHUB_OUTPUT"
+          echo '=== R2 export summary ==='
+          rclone lsf "$RELEASE_PATH" --files-only
+          {
+            echo "## Chromium Windows release files"
+            echo "- R2 export: \`$RELEASE_PATH\`"
+            echo "- Checkpoint remains at: \`$R2_ROOT\`"
+            echo "- Runtime ZIP: \`$(basename '${{ steps.export.outputs.runtime_zip }}')\`"
+            echo "- Compiled .lib files are a separate archive when present."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Windows runtime for GitHub download
+        if: ${{ always() && steps.export.outputs.ready == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-windows-runtime-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.export.outputs.runtime_zip }}
+            ${{ steps.export.outputs.runtime_sha }}
+            ${{ steps.export.outputs.manifest }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload compiled libraries for GitHub download
+        if: ${{ always() && steps.export.outputs.libs_github_ready == 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-windows-libs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.export.outputs.libs_zst }}
+            ${{ steps.export.outputs.libs_sha }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
       - name: Dispatch next pass
         if: >-
           ${{
             inputs.auto_resume &&
+            !inputs.export_only &&
             steps.checkpoint.outputs.committed == 'true' &&
             (
               steps.sync.outputs.resume == 'true' ||
@@ -1043,6 +1247,9 @@ jobs:
             echo "- Restored layer: ${RESTORED_LAST:-0}"
             echo "- Committed layer: ${{ steps.checkpoint.outputs.layer || 'none' }}"
             echo "- Build completed: ${{ steps.build.outputs.completed || 'false' }}"
+            echo "- Export-only: ${{ inputs.export_only || 'false' }}"
+            echo "- Export ready: ${{ steps.export.outputs.ready || 'false' }}"
+            echo "- Release objects: ${{ steps.export_r2.outputs.release_path || 'none' }}"
             echo '```'
             df -h /
             free -h
