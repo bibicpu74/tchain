@@ -1,0 +1,974 @@
+name: Chromium Windows 155 - Build Mini Installer from R2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chromium-windows-155-r2-v3
+  cancel-in-progress: false
+
+jobs:
+  installer:
+    name: Build Chromium mini_installer from completed R2 checkpoint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 355
+    outputs:
+      installer_artifact: ${{ steps.install_package.outputs.artifact_name }}
+    env:
+      CHROMIUM_VERSION: '155.0.8059.79'
+      WORK: /mnt/chromium-ci/work
+      IMAGE: /home/runner/work/chromium-ci.img
+      IMAGE_GIB: '220'
+      BTRFS_ZSTD: '1'
+      MIN_FREE_GIB: '12'
+      BUILD_JOBS: '3'
+      INSTALLER_SOFT_DEADLINE_MINUTES: '300'
+      PINNED_RCLONE_VERSION: '1.75.2'
+      R2_ROOT: r2:${{ vars.R2_BUCKET || secrets.R2_BUCKET }}/chromium-win155-x64-v3
+      R2_BUCKET: ${{ vars.R2_BUCKET || secrets.R2_BUCKET }}
+      RCLONE_CONFIG_R2_TYPE: s3
+      RCLONE_CONFIG_R2_PROVIDER: Cloudflare
+      RCLONE_CONFIG_R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      RCLONE_CONFIG_R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      RCLONE_CONFIG_R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      RCLONE_CONFIG_R2_REGION: auto
+      RCLONE_CONFIG_R2_NO_CHECK_BUCKET: 'true'
+      DEPOT_TOOLS_WIN_TOOLCHAIN: '1'
+      GIT_TERMINAL_PROMPT: '0'
+      TOOLCHAIN_URL: https://pub-8f1f5b85dfa3490cb6526249c67b4237.r2.dev/chromium-win-toolchain-vs2026-sdk28000.zip
+      TOOLCHAIN_SHA256: ${{ vars.TOOLCHAIN_SHA256 }}
+    steps:
+      - name: Reclaim disk and install build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RUN_START=$(date +%s)" >> "$GITHUB_ENV"
+          FREE_BEFORE=$(df -Pk / | awk 'NR==2 {print $4}')
+          echo '=== BEFORE CLEANUP ==='
+          df -h /
+          free -h
+
+          sudo swapoff -a || true
+          sudo rm -f /swapfile /build-swap /mnt/swapfile /mnt/soong-swap-base || true
+          sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null || true
+          sudo rm -rf \
+            /var/lib/docker /var/lib/containerd /var/cache/apt/archives/* \
+            /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache /usr/local/share/boost /usr/share/swift \
+            /usr/local/share/powershell /usr/local/lib/node_modules /usr/local/graalvm \
+            /usr/share/rust /usr/share/php* /usr/local/share/chromium \
+            /usr/share/miniconda /usr/local/aws-cli /usr/local/aws-sam-cli \
+            /usr/local/share/vcpkg /opt/google /opt/microsoft /usr/share/postgresql \
+            /usr/share/mysql /usr/local/julia* /opt/az \
+            /usr/local/google-cloud-sdk /usr/lib/google-cloud-sdk \
+            /usr/local/share/gradle /usr/share/gradle /opt/pipx \
+            /home/runner/.gradle/caches /home/runner/.npm/_cacache \
+            /home/runner/.cache/pip /root/.cache/pip || true
+
+          sudo apt-get clean || true
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            btrfs-progs ciopfs fuse3 zstd unzip zip jq git git-lfs ninja-build
+          sudo apt-get clean
+          sudo rm -rf /var/lib/apt/lists/*
+
+          echo '=== Install pinned modern rclone (Ubuntu 24.04 apt is 1.60.1) ==='
+          RCLONE_TMP="$RUNNER_TEMP/rclone-v${PINNED_RCLONE_VERSION}"
+          mkdir -p "$RCLONE_TMP"
+          RCLONE_FILE="rclone-v${PINNED_RCLONE_VERSION}-linux-amd64.zip"
+          curl -fL --retry 5 --retry-delay 5 \
+            "https://downloads.rclone.org/v${PINNED_RCLONE_VERSION}/${RCLONE_FILE}" \
+            -o "$RCLONE_TMP/$RCLONE_FILE"
+          curl -fL --retry 5 --retry-delay 5 \
+            "https://downloads.rclone.org/v${PINNED_RCLONE_VERSION}/SHA256SUMS" \
+            -o "$RCLONE_TMP/SHA256SUMS"
+          (cd "$RCLONE_TMP" && \
+            awk -v file="$RCLONE_FILE" '$2 == file {print}' SHA256SUMS \
+              | sha256sum --check -)
+          unzip -q "$RCLONE_TMP/$RCLONE_FILE" -d "$RCLONE_TMP"
+          sudo install -m 0755 \
+            "$RCLONE_TMP/rclone-v${PINNED_RCLONE_VERSION}-linux-amd64/rclone" \
+            /usr/local/bin/rclone
+          /usr/local/bin/rclone version
+
+          cat > "$GITHUB_WORKSPACE/ci-metrics.sh" <<'SH'
+          ci_metrics() {
+            echo '====== CI RESOURCE REPORT ======'
+            echo "Time: $(date -u +%FT%TZ)"
+            echo "CPU: $(nproc)"
+            echo '--- RAM / Swap ---'
+            free -h || true
+            echo '--- Host disk ---'
+            df -h / || true
+            echo '--- Host free bytes ---'
+            df -PB1 / || true
+            if mountpoint -q /mnt/chromium-ci; then
+              echo '--- Btrfs filesystem ---'
+              df -h /mnt/chromium-ci || true
+              sudo btrfs filesystem usage /mnt/chromium-ci || true
+            fi
+            if [ -f "${IMAGE:-/nonexistent}" ]; then
+              echo '--- Sparse image actual disk usage ---'
+              du -h "$IMAGE" || true
+            fi
+            echo '================================'
+          }
+          ci_begin() {
+            echo "=== STEP: $1 ==="
+            ci_metrics
+            trap 'ci_metrics' EXIT
+          }
+          SH
+
+          FREE_AFTER=$(df -Pk / | awk 'NR==2 {print $4}')
+          awk -v before="$FREE_BEFORE" -v after="$FREE_AFTER" \
+            'BEGIN {printf "Before: %.2f GiB, after: %.2f GiB, net change: %.2f GiB\n", before/1048576, after/1048576, (after-before)/1048576}'
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin 'Disk cleanup'
+          rclone version
+          ninja --version
+
+      - name: Create Btrfs 220 GiB ZSTD1 workspace
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin 'Btrfs init'
+          sudo install -d -m 0755 /mnt/chromium-ci
+          sudo truncate -s "${IMAGE_GIB}G" "$IMAGE"
+          sudo mkfs.btrfs -f -q "$IMAGE"
+          sudo mount -o loop,compress=zstd:1,discard=async "$IMAGE" /mnt/chromium-ci
+          sudo chown "$USER:$USER" /mnt/chromium-ci
+          mkdir -p "$WORK"
+          findmnt /mnt/chromium-ci
+
+      - name: Restore completed Chromium checkpoint from R2 (overlay)
+        id: restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin 'R2 restore'
+          : "${R2_BUCKET:?Set Actions variable R2_BUCKET}"
+          : "${RCLONE_CONFIG_R2_ACCESS_KEY_ID:?Set R2_ACCESS_KEY_ID}"
+          : "${RCLONE_CONFIG_R2_SECRET_ACCESS_KEY:?Set R2_SECRET_ACCESS_KEY}"
+          rclone lsf "r2:$R2_BUCKET" >/dev/null
+
+          echo "Checkpoint prefix: $R2_ROOT"
+          LISTING="$(rclone lsjson "$R2_ROOT" --files-only --no-modtime --no-mimetype)"
+          POINTER_SIZE="$(jq -r '[.[] | select(.Name == "latest.txt") | .Size] | first // -1' <<< "$LISTING")"
+          LAST=0
+          if (( POINTER_SIZE == -1 )); then
+            echo 'No committed checkpoint: fresh build (layer 0).'
+          elif (( POINTER_SIZE == 0 )); then
+            echo '::error::R2 latest.txt is empty. Refusing destructive fallback.'
+            exit 1
+          else
+            rclone copyto "$R2_ROOT/latest.txt" "$RUNNER_TEMP/latest.txt" --retries 5
+            LAST="$(tr -d '[:space:]' < "$RUNNER_TEMP/latest.txt")"
+            [[ "$LAST" =~ ^[1-9][0-9]*$ ]] || {
+              echo "::error::Invalid checkpoint pointer: $LAST"
+              exit 1
+            }
+          fi
+          echo "Committed checkpoint: $LAST"
+
+          # GNU tar incremental extraction may infer directory renames from
+          # inode records across snapshots and fail with 'Directory not empty'.
+          # Export-only requires the compiled outputs, not an exact filesystem
+          # mirror for continuing Ninja. Overlay extraction deliberately skips
+          # GNU incremental directory renames/deletions while applying file data
+          # in chronological order. Do NOT use this mode for build/resume.
+          TAR_RESTORE_ARGS=(
+            --extract --xattrs '--xattrs-include=user.*'
+            --no-same-owner --no-same-permissions
+          )
+          # Export-style overlay is necessary because some GNU tar incremental
+          # directory rename records in layers 1..4 cannot be replayed exactly.
+          # This job MUST NOT write another incremental checkpoint. We validate
+          # GN settings and build only mini_installer using the restored files.
+          TAR_RESTORE_ARGS+=(--no-overwrite-dir)
+          echo 'Restore mode: overlay for installer-only; original R2 state is read-only.'
+          if (( LAST == 0 )); then
+            echo '::error::No committed Chromium checkpoint found.'
+            exit 1
+          fi
+
+          if (( LAST > 0 )); then
+            for N in $(seq 1 "$LAST"); do
+              echo "=== Restoring layer $N/$LAST ==="
+              # v4 checkpoint: independently uploaded 256MiB single-PUT objects.
+              # Continue to read previously committed v3 .tar.zst layers.
+              LAYER_LIST="$(rclone lsjson "$R2_ROOT/layers/$N" --files-only --no-modtime --no-mimetype)"
+              if jq -e '[.[] | select(.Name == "manifest.json")] | length == 1' \
+                <<< "$LAYER_LIST" >/dev/null; then
+                MANIFEST="$RUNNER_TEMP/r2-manifest-$N.json"
+                rclone copyto "$R2_ROOT/layers/$N/manifest.json" "$MANIFEST" --retries 5
+                python3 - "$R2_ROOT/layers/$N" "$MANIFEST" "$RUNNER_TEMP" <<'PYRESTORE' \
+                  | zstd -d -c \
+                  | tar "${TAR_RESTORE_ARGS[@]}" -C "$WORK" -f -
+          import hashlib
+          import json
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          prefix, manifest_path, scratch = sys.argv[1:]
+          manifest = json.loads(Path(manifest_path).read_text())
+          if manifest.get('format') != 'chunked-zstd-tar-v1':
+              raise SystemExit('Unsupported checkpoint format')
+          parts = manifest.get('parts')
+          if not isinstance(parts, list) or not parts:
+              raise SystemExit('Empty or invalid checkpoint manifest')
+          scratch = Path(scratch)
+          for i, part in enumerate(parts):
+              name = part.get('name', '')
+              if name != f'part-{i:06d}.bin':
+                  raise SystemExit(f'Unexpected checkpoint part: {name!r}')
+              expected_size = part.get('size')
+              expected_sha = part.get('sha256', '')
+              if not isinstance(expected_size, int) or not (0 < expected_size <= 256*1024*1024):
+                  raise SystemExit(f'Invalid part size: {expected_size}')
+              if not re.fullmatch('[0-9a-f]{64}', expected_sha):
+                  raise SystemExit(f'Invalid SHA256 for {name}')
+              local = scratch / f'r2-restore-{i:06d}.bin'
+              try:
+                  print(f'Restoring {name} ({expected_size} bytes)', file=sys.stderr, flush=True)
+                  subprocess.run(['rclone', 'copyto', f'{prefix}/{name}', str(local),
+                                  '--retries', '5', '--low-level-retries', '10'], check=True)
+                  digest = hashlib.sha256()
+                  total = 0
+                  with local.open('rb') as f:
+                      while True:
+                          buf = f.read(4*1024*1024)
+                          if not buf:
+                              break
+                          total += len(buf)
+                          digest.update(buf)
+                  if total != expected_size or digest.hexdigest() != expected_sha:
+                      raise SystemExit(f'Corrupt checkpoint part {name}; refusing restore')
+                  with local.open('rb') as f:
+                      while True:
+                          buf = f.read(4*1024*1024)
+                          if not buf:
+                              break
+                          sys.stdout.buffer.write(buf)
+              finally:
+                  local.unlink(missing_ok=True)
+          sys.stdout.buffer.flush()
+          PYRESTORE
+              else
+                echo "Single-object checkpoint: $N.tar.zst"
+                EXPECTED_HASH="$RUNNER_TEMP/layer-$N-expected.sha256"
+                RECEIVED_HASH="$RUNNER_TEMP/layer-$N-received.sha256"
+                HAS_SHA=0
+                if rclone lsf "$R2_ROOT/layers" --files-only \
+                    | grep -Fxq "$N.sha256"; then
+                  rclone copyto "$R2_ROOT/layers/$N.sha256" "$EXPECTED_HASH" --retries 5
+                  test -s "$EXPECTED_HASH"
+                  HAS_SHA=1
+                fi
+                # Hash compressed data while streaming; do not buffer huge archives.
+                HASH_RELAY=$'import hashlib,sys\nh=hashlib.sha256(); i=sys.stdin.buffer; o=sys.stdout.buffer\nwhile True:\n b=i.read(8*1024*1024)\n if not b: break\n h.update(b); o.write(b); o.flush()\nopen(sys.argv[1],"w").write(h.hexdigest()+"\\n")'
+                rclone cat "$R2_ROOT/layers/$N.tar.zst" --stats 30s --stats-one-line \
+                  | python3 -c "$HASH_RELAY" "$RECEIVED_HASH" \
+                  | zstd -d -c \
+                  | tar "${TAR_RESTORE_ARGS[@]}" -C "$WORK" -f -
+                if (( HAS_SHA )); then
+                  cmp -s "$EXPECTED_HASH" "$RECEIVED_HASH" || {
+                    echo "::error::Checkpoint $N compressed SHA256 mismatch"
+                    exit 1
+                  }
+                fi
+              fi
+            done
+            echo '=== Verify Chromium completed build after overlay restore ==='
+            test -s "$WORK/chromium_build/src/out/Default/chrome.exe" || {
+              echo '::error::Restored checkpoint does not contain chrome.exe'; exit 1;
+            }
+            test -f "$WORK/.build-complete" || {
+              echo '::error::Missing completed-build marker in restored checkpoint'; exit 1;
+            }
+            echo 'Skipping .snar: this job does not modify checkpoint layers.'
+          fi
+          mkdir -p "$WORK"
+          echo "RESTORED_LAST=$LAST" >> "$GITHUB_ENV"
+          echo "checkpoint=$LAST" >> "$GITHUB_OUTPUT"
+          echo "R2 restore complete at layer $LAST"
+
+      - name: Set up depot_tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin 'depot_tools'
+          if [ ! -d "$WORK/depot_tools/.git" ]; then
+            git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$WORK/depot_tools"
+          fi
+          echo "$WORK/depot_tools" >> "$GITHUB_PATH"
+          export PATH="$WORK/depot_tools:$PATH"
+          command -v gclient
+
+      - name: Fetch or resume Chromium sources
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin 'Chromium sync'
+          export PATH="$WORK/depot_tools:$PATH"
+          ROOT="$WORK/chromium_build"
+          SRC="$ROOT/src"
+          mkdir -p "$ROOT"
+          if [ -f "$WORK/.source-ready" ] && [ -f "$SRC/DEPS" ]; then
+            echo 'Restored synchronized sources.'
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          DEADLINE=$((RUN_START + INSTALLER_SOFT_DEADLINE_MINUTES*60))
+          LEFT=$((DEADLINE - $(date +%s)))
+          if (( LEFT < 300 )); then
+            echo 'resume=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ ! -d "$SRC/.git" ]; then
+            git clone --depth 1 --branch "$CHROMIUM_VERSION" \
+              https://chromium.googlesource.com/chromium/src.git "$SRC"
+          fi
+          cd "$ROOT"
+          if [ ! -f .gclient ]; then
+            gclient config --unmanaged --name=src https://chromium.googlesource.com/chromium/src.git
+          fi
+          # Ensure host Linux dependencies plus Windows dependencies are synchronized.
+          python3 - <<'PY'
+          from pathlib import Path
+          f = Path('.gclient')
+          s = f.read_text()
+          if 'target_os =' not in s:
+              f.write_text(s + "\ntarget_os = ['win']\n")
+          elif "target_os = ['win']" not in s:
+              raise SystemExit('Unexpected .gclient target_os setting')
+          PY
+          LEFT=$((DEADLINE - $(date +%s)))
+          if (( LEFT < 300 )); then
+            echo 'resume=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          set +e
+          timeout -s INT -k 90s "${LEFT}s" \
+            gclient sync --nohooks --no-history --jobs 4
+          RC=$?
+          set -e
+          if (( RC == 0 )); then
+            touch "$WORK/.source-ready"
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          elif (( RC == 124 )); then
+            echo 'Sync time slice complete, checkpointing.'
+            echo 'resume=true' >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::gclient sync failed with $RC"
+            exit "$RC"
+          fi
+
+      - name: Install VS 2026 SDK28000 toolchain (ciopfs-safe)
+        id: toolchain
+        if: steps.sync.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin 'Windows toolchain - inspect, extract and validate'
+          export PATH="$WORK/depot_tools:$PATH"
+          SRC="$WORK/chromium_build/src"
+          BACKING="$WORK/win_toolchain_backing"
+          VIEW="$WORK/win_toolchain"
+          CACHE="$WORK/toolchain-download"
+          # IMPORTANT: ciopfs maps visible mixed-case names onto lowercase
+          # filenames in BACKING. The previous workflow extracted ZIP entries
+          # with names such as VS_VERSION, VC, and Windows Kits directly into
+          # BACKING, making them invisible through VIEW.
+          # A failed previous run may have checkpointed that broken tree to R2.
+          # Clean only this corrupted toolchain tree, preserving the downloaded
+          # ZIP and all Chromium source/build outputs.
+          if mountpoint -q "$VIEW"; then
+            echo 'ciopfs mount already active.'
+          else
+            if [ -e "$BACKING/VS_VERSION" ] || \
+               [ -d "$BACKING/VC" ] || \
+               [ -d "$BACKING/Windows Kits" ]; then
+              echo '=== Repair previous uppercase ciopfs backing ==='
+              echo 'Detected ZIP files extracted directly to the backing tree.'
+              du -sh "$BACKING" || true
+              rm -rf "$BACKING"
+              echo 'Removed broken toolchain extraction; cached ZIP is retained.'
+            fi
+          fi
+          mkdir -p "$BACKING" "$VIEW" "$CACHE"
+          if ! mountpoint -q "$VIEW"; then
+            ciopfs -o use_ino "$BACKING" "$VIEW"
+          fi
+          mountpoint -q "$VIEW" || { echo '::error::ciopfs mount failed'; exit 1; }
+          echo '=== Verify ciopfs write/read path ==='
+          printf 'case-insensitive-ok\n' > "$VIEW/CiOpFs-Sanity-Check"
+          test -f "$BACKING/ciopfs-sanity-check" || {
+            echo '::error::ciopfs did not create lowercase backing filename.'
+            exit 1
+          }
+          test "$(cat "$VIEW/CIOPFS-SANITY-CHECK")" = 'case-insensitive-ok' || {
+            echo '::error::ciopfs case-insensitive lookup failed.'
+            exit 1
+          }
+          rm -f "$VIEW/CiOpFs-Sanity-Check"
+
+          # Existing backing files are checkpointed, but FUSE mount is NOT:
+          # remount ciopfs before checking the toolchain on each new runner.
+          if [ -f "$WORK/.win-toolchain-ready" ] && \
+             [ -f "$SRC/build/win_toolchain.json" ] && \
+             [ -f "$VIEW/VS_VERSION" ] && \
+             [ -f "$VIEW/Windows Kits/10/bin/SetEnv.x64.json" ]; then
+            echo 'Restored VS/SDK package; skipping download and extraction.'
+          else
+            LEFT=$((RUN_START + INSTALLER_SOFT_DEADLINE_MINUTES*60 - $(date +%s)))
+            if (( LEFT < 1200 )); then
+              echo 'Not enough time left to download/extract; checkpointing.'
+              echo 'resume=true' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            ZIP="$CACHE/package.zip"
+            if [ ! -s "$ZIP" ]; then
+              echo '=== Downloading toolchain ZIP to persistent Btrfs cache ==='
+              # A .part download is not trusted; resume transfers only if server
+              # supports HTTP Range, otherwise curl restarts the download.
+              set +e
+              timeout -s INT -k 90s "${LEFT}s" \
+                curl -fL --retry 5 --retry-delay 5 \
+                  --continue-at - "$TOOLCHAIN_URL" -o "$CACHE/package.part"
+              RC=$?
+              set -e
+              if (( RC == 124 )); then
+                echo 'Toolchain transfer time slice reached.'
+                echo 'resume=true' >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              (( RC == 0 )) || exit "$RC"
+              mv "$CACHE/package.part" "$ZIP"
+            fi
+            if [ -n "${TOOLCHAIN_SHA256:-}" ]; then
+              echo "$TOOLCHAIN_SHA256  $ZIP" | sha256sum -c -
+            fi
+
+            echo '=== Inspect ZIP nesting, entries and SDK version ==='
+            LEFT=$((RUN_START + INSTALLER_SOFT_DEADLINE_MINUTES*60 - $(date +%s)))
+            if (( LEFT < 300 )); then
+              echo 'Not enough time for extraction; preserving ZIP in R2 checkpoint.'
+              echo 'resume=true' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # The Windows packaging action uploaded a ZIP *inside* an Actions
+            # Artifact. Python zipfile + normalized paths supports either format.
+            # Extract THROUGH ciopfs VIEW. Direct writes to BACKING with
+            # uppercase names are invisible inside the FUSE mount.
+            set +e
+            timeout -s INT -k 90s "${LEFT}s" \
+              python3 - "$ZIP" "$VIEW" <<'PY'
+          import os
+          import re
+          import shutil
+          import sys
+          import tempfile
+          import zipfile
+          from pathlib import Path
+
+          outer = Path(sys.argv[1])
+          destination = Path(sys.argv[2])
+          sdk = '10.0.28000.0'
+
+          def norm(name):
+              # ZIPs produced on Windows may use either slash convention.
+              return name.replace('\\', '/').lstrip('./')
+
+          def summary(zf, label):
+              names = [norm(i.filename) for i in zf.infolist()]
+              print(f'{label}: {len(names)} entries', flush=True)
+              for name in names[:18]:
+                  print('  ZIP:', name, flush=True)
+              return names
+
+          def package_prefix(names):
+              # Official package_from_installed.py includes VS_VERSION at root.
+              markers = [n[:-len('VS_VERSION')] for n in names
+                         if n.casefold().endswith('vs_version')]
+              for prefix in sorted(markers, key=len):
+                  low = [n[len(prefix):].lower() for n in names
+                         if n.startswith(prefix)]
+                  has_vs = any(re.match(
+                      r'vc/tools/msvc/[^/]+/include/', n) for n in low)
+                  has_sdk = any(n.startswith(
+                      f'windows kits/10/include/{sdk.lower()}/') for n in low)
+                  if has_vs and has_sdk:
+                      return prefix
+              return None
+
+          def extract(zf, prefix, dest):
+              count = 0
+              for info in zf.infolist():
+                  path = norm(info.filename)
+                  if not path.startswith(prefix):
+                      continue
+                  relative = path[len(prefix):]
+                  if not relative or info.is_dir() or path.endswith('/'):
+                      continue
+                  parts = relative.split('/')
+                  if any(p in ('', '.', '..') for p in parts) or ':' in parts[0]:
+                      raise SystemExit(f'Unsafe path in ZIP: {relative!r}')
+                  target = dest.joinpath(*parts)
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  # Atomic replacement avoids trusting partial extracted files
+                  # when the process is interrupted and a later pass resumes.
+                  tmp = target.with_name(target.name + '.ci-unpacking')
+                  with zf.open(info) as src, open(tmp, 'wb') as out:
+                      shutil.copyfileobj(src, out, length=2 * 1024 * 1024)
+                  os.replace(tmp, target)
+                  count += 1
+                  if count % 3000 == 0:
+                      print(f'Extracted {count} files...', flush=True)
+              print(f'Extracted {count} package files to {dest}', flush=True)
+              if count == 0:
+                  raise SystemExit('ZIP selection contained no files')
+
+          with zipfile.ZipFile(outer) as zf:
+              names = summary(zf, 'Downloaded archive')
+              prefix = package_prefix(names)
+              if prefix is None:
+                  candidates = [i for i in zf.infolist()
+                                if re.search(r'(?i)(?:^|/)[0-9a-f]{10}\.zip$',
+                                             norm(i.filename))]
+                  if len(candidates) != 1:
+                      candidates = [i for i in zf.infolist()
+                                    if norm(i.filename).lower().endswith('.zip')]
+                  if len(candidates) != 1:
+                      raise SystemExit(
+                          'Archive contains no VS_VERSION/MSVC/SDK tree and '
+                          f'{len(candidates)} nested ZIP candidates; '
+                          'expected toolchain ZIP or a GitHub Artifact ZIP.')
+                  inner_name = norm(candidates[0].filename)
+                  print('Found nested toolchain ZIP:', inner_name, flush=True)
+                  with tempfile.NamedTemporaryFile(
+                      dir=outer.parent, suffix='.zip') as temp:
+                      with zf.open(candidates[0]) as src:
+                          shutil.copyfileobj(src, temp, length=4 * 1024 * 1024)
+                      temp.flush()
+                      with zipfile.ZipFile(temp.name) as nested:
+                          summary(nested, 'Nested package')
+                          prefix = package_prefix(
+                              [norm(i.filename) for i in nested.infolist()])
+                          if prefix is None:
+                              raise SystemExit(
+                                  'Nested ZIP does not contain MSVC + SDK '
+                                  f'{sdk} + VS_VERSION: verify publishing URL.')
+                          archives = [(nested, prefix)]
+                          extract(archives[0][0], archives[0][1], destination)
+              else:
+                  extract(zf, prefix, destination)
+
+          PY
+            RC=$?
+            set -e
+            if (( RC == 124 )); then
+              echo 'Toolchain extraction time slice elapsed; retry next pass.'
+              echo 'resume=true' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            (( RC == 0 )) || exit "$RC"
+
+            echo '=== Toolchain files now visible through ciopfs ==='
+            ls -ld "$VIEW/VS_VERSION" "$VIEW/VC/Tools/MSVC" \
+              "$VIEW/Windows Kits/10" || true
+            test -f "$VIEW/VS_VERSION" || {
+              echo '::error::VS_VERSION still not visible in ciopfs mount.'
+              echo 'Visible entries:'
+              ls -lah "$VIEW" | head -n 40
+              echo 'Backing entries:'
+              ls -lah "$BACKING" | head -n 40
+              exit 1
+            }
+
+            # Configure Chromium using the packaged, already generated
+            # SetEnv.x64.json (not a home-made INCLUDE/LIB approximation).
+            python3 - "$VIEW" "$BACKING" "$SRC" <<'PY'
+          import json
+          import re
+          import sys
+          from pathlib import Path
+
+          view, backing, src = map(Path, sys.argv[1:])
+          setup = src / 'build/toolchain/win/setup_toolchain.py'
+          source = setup.read_text()
+          match = re.search(r'^SDK_VERSION\s*=\s*[\'\"]([^\'\"]+)', source, re.M)
+          expected_sdk = match.group(1) if match else '10.0.28000.0'
+          sdk = '10.0.28000.0'
+          if expected_sdk != sdk:
+              raise SystemExit(f'Chromium expects Windows SDK {expected_sdk}, '
+                               f'but ZIP contains {sdk}.')
+
+          root = view
+          vs_version = (root / 'VS_VERSION').read_text().strip()
+          if vs_version != '2026':
+              raise SystemExit(f'Unexpected VS_VERSION={vs_version!r}')
+
+          incs = sorted((root / 'VC/Tools/MSVC').glob('*/include'))
+          sdkroot = root / 'Windows Kits/10'
+          sdkinc = sdkroot / 'Include' / sdk
+          if not incs or not (sdkinc / 'um').is_dir() or not (sdkinc / 'ucrt').is_dir():
+              raise SystemExit('Toolchain ZIP missing VC headers or SDK Include/10.0.28000.0')
+
+          vc_root = incs[-1].parent
+          vc_bin = vc_root / 'bin/HostX64/x64'
+          required = [
+              vc_bin / 'cl.exe',
+              vc_root / 'lib/x64',
+              sdkroot / 'Lib' / sdk / 'um/x64',
+              sdkroot / 'Lib' / sdk / 'ucrt/x64',
+              sdkroot / 'bin/SetEnv.x64.json',
+          ]
+          for p in required:
+              if not p.exists():
+                  raise SystemExit(f'Missing toolchain component: {p}')
+
+          # Windows packager already generated the original relative paths.
+          # Access/write ONLY via ciopfs VIEW, never directly through BACKING.
+          original = view / 'Windows Kits/10/bin/SetEnv.x64.json'
+          data = json.loads(original.read_text())
+          env = data['env']
+          for key, groups in env.items():
+              env[key] = [[part.replace('\\', '/') for part in parts]
+                          for parts in groups]
+          original.write_text(json.dumps(data, indent=2))
+
+          def runtime(d):
+              p = root / d
+              return str(p) if p.is_dir() else 'Arm64Unused'
+
+          config = {
+              'path': str(root),
+              'version': vs_version,
+              'win_sdk': str(sdkroot),
+              'wdk': '',
+              'runtime_dirs': [runtime('sys64'), runtime('sys32'),
+                               runtime('sysarm64')],
+          }
+          result = src / 'build/win_toolchain.json'
+          result.write_text(json.dumps(config, indent=2))
+          print('VS:', vs_version, 'MSVC:', vc_root.name)
+          print('SDK:', sdkroot, 'version:', sdk)
+          print('SetEnv:', original)
+          print('Chromium configuration:', result)
+          PY
+            touch "$WORK/.win-toolchain-ready"
+            # A successful extraction no longer needs a second ZIP copy in R2.
+            rm -f "$CACHE/package.zip" "$CACHE/package.part"
+          fi
+          test -f "$SRC/build/win_toolchain.json"
+          test -f "$VIEW/Windows Kits/10/bin/SetEnv.x64.json"
+          python3 "$SRC/build/vs_toolchain.py" get_toolchain_dir
+
+      - name: Run Chromium gclient hooks
+        id: hooks
+        if: steps.toolchain.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin 'gclient hooks'
+          export PATH="$WORK/depot_tools:$PATH"
+          if [ -f "$WORK/.hooks-ready" ]; then
+            echo 'Hooks restored.'
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LEFT=$((RUN_START + INSTALLER_SOFT_DEADLINE_MINUTES*60 - $(date +%s)))
+          if (( LEFT < 300 )); then
+            echo 'resume=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cd "$WORK/chromium_build"
+          set +e
+          DEPOT_TOOLS_WIN_TOOLCHAIN=0 timeout -s INT -k 90s "${LEFT}s" gclient runhooks
+          RC=$?
+          set -e
+          if (( RC == 0 )); then
+            touch "$WORK/.hooks-ready"
+            echo 'ready=true' >> "$GITHUB_OUTPUT"
+          elif (( RC == 124 )); then
+            echo 'resume=true' >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::gclient runhooks failed with $RC"
+            exit "$RC"
+          fi
+
+      - name: Verify unchanged GN arguments and generate installer build graph
+        id: gn
+        if: steps.hooks.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin 'GN - preserve original build settings'
+          export PATH="$WORK/depot_tools:$PATH"
+          cd "$WORK/chromium_build/src"
+          test -s out/Default/chrome.exe
+          test -f "$WORK/.build-complete"
+          test -s out/Default/args.gn
+          python3 - <<'PYGN'
+          from pathlib import Path
+          import re
+          s = Path('out/Default/args.gn').read_text()
+          required = {
+              'target_os':'"win"', 'target_cpu':'"x64"',
+              'is_debug':'false', 'is_component_build':'false',
+              'is_official_build':'false', 'is_clang':'true',
+              'symbol_level':'0', 'blink_symbol_level':'0',
+          }
+          for key, expected in required.items():
+              match = re.search(r'^\s*'+re.escape(key)+r'\s*=\s*(.*?)\s*(?:#.*)?$', s, re.M)
+              if not match or match.group(1).strip() != expected:
+                  raise SystemExit(f'GN args mismatch: {key} must be {expected}; refusing config changes')
+          print('PASS: GN arguments match completed Chromium build (is_official_build=false).')
+          PYGN
+          python3 build/vs_toolchain.py get_toolchain_dir
+          gn gen out/Default
+          test -s out/Default/build.ninja
+          echo '=== Installer target available ==='
+          gn ls out/Default '//chrome/installer/mini_installer:mini_installer'
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+
+      - name: Build mini_installer only (reuse Chromium objects)
+        id: build_installer
+        if: steps.gn.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin 'Ninja mini_installer'
+          export PATH="$WORK/depot_tools:$PATH"
+          cd "$WORK/chromium_build/src"
+          OUT=out/Default
+          LEFT=$((RUN_START + INSTALLER_SOFT_DEADLINE_MINUTES*60 - $(date +%s)))
+          if (( LEFT < 600 )); then
+            echo '::error::Insufficient time budget left for mini_installer build.'
+            exit 1
+          fi
+          echo "Installer target: mini_installer; -j${BUILD_JOBS}; available ${LEFT}s"
+          echo '=== Dry-run target to estimate pending actions ==='
+          ninja -n -C "$OUT" mini_installer > "$RUNNER_TEMP/installer-dry-run.log" 2>&1 || {
+            tail -n 100 "$RUNNER_TEMP/installer-dry-run.log"
+            exit 1
+          }
+          tail -n 8 "$RUNNER_TEMP/installer-dry-run.log"
+          set +e
+          timeout -s INT -k 120s "${LEFT}s" \
+            ninja -C "$OUT" -j "$BUILD_JOBS" mini_installer \
+            > "$RUNNER_TEMP/installer-build.log" 2>&1 &
+          PID=$!
+          DISK_STOP=0
+          while kill -0 "$PID" 2>/dev/null; do
+            sleep 30
+            tail -n 8 "$RUNNER_TEMP/installer-build.log" || true
+            FREE_KIB=$(df -Pk / | awk 'NR==2 {print $4}')
+            if (( FREE_KIB < MIN_FREE_GIB*1024*1024 )); then
+              echo '::error::Physical disk guard reached during installer build.'
+              DISK_STOP=1
+              kill -INT "$PID" 2>/dev/null || true
+              break
+            fi
+          done
+          wait "$PID"
+          RC=$?
+          set -e
+          if (( RC != 0 || DISK_STOP == 1 )); then
+            echo "::error::mini_installer build interrupted/failed (exit=${RC}); original R2 checkpoint untouched."
+            tail -n 120 "$RUNNER_TEMP/installer-build.log" || true
+            exit 1
+          fi
+          test -s "$OUT/mini_installer.exe" || {
+            echo '::error::mini_installer target finished but mini_installer.exe is missing'; exit 1;
+          }
+          echo '=== Installer built ==='
+          ls -lh "$OUT/mini_installer.exe" "$OUT/chrome.exe"
+          sha256sum "$OUT/mini_installer.exe"
+          echo 'ready=true' >> "$GITHUB_OUTPUT"
+
+      - name: Package and verify Chromium Windows installer
+        id: install_package
+        if: steps.build_installer.outputs.ready == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin 'Package Chromium mini_installer (non-official build)'
+          OUT="$WORK/chromium_build/src/out/Default"
+          DIST="$GITHUB_WORKSPACE/installer-export"
+          mkdir -p "$DIST"
+          NAME="mini_installer.exe"
+          cp -p "$OUT/mini_installer.exe" "$DIST/$NAME"
+          test -s "$DIST/$NAME"
+          (cd "$DIST" && sha256sum "$NAME" > "$NAME.sha256")
+          cat > "$DIST/README.txt" <<EOF
+          Chromium ${CHROMIUM_VERSION} - Windows x64 mini_installer
+          Built on Linux using original GN args from completed R2 checkpoint.
+          is_official_build=false; is_debug=false; is_component_build=false.
+
+          Double-click installer EXE for a per-user installation.
+          Default install path: %LOCALAPPDATA%\Chromium\Application
+          For diagnostics: run mini_installer.exe --verbose-logging
+          Installer log: %TEMP%\chromium_installer.log
+
+          This custom build is not signed by Google/Microsoft. Windows SmartScreen
+          may show an unrecognized-publisher warning; do not bypass such warnings
+          unless you trust the build source and have verified its checksum.
+          EOF
+          echo 'Installer and checksums:'
+          ls -lh "$DIST"
+          cat "$DIST/$NAME.sha256"
+          echo "exe=$DIST/$NAME" >> "$GITHUB_OUTPUT"
+          echo "sha=$DIST/$NAME.sha256" >> "$GITHUB_OUTPUT"
+          echo 'artifact_name=chromium-mini-installer-${{ github.run_id }}' >> "$GITHUB_OUTPUT"
+
+      - name: Upload installer to R2 without touching build checkpoint
+        id: installer_r2
+        if: steps.install_package.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          source "$GITHUB_WORKSPACE/ci-metrics.sh"
+          ci_begin 'Upload mini_installer to R2'
+          DIST="$GITHUB_WORKSPACE/installer-export"
+          DEST="$R2_ROOT/installers/${CHROMIUM_VERSION}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          for SOURCE in "$DIST"/*; do
+            test -f "$SOURCE" || continue
+            REMOTE="$DEST/$(basename "$SOURCE")"
+            rclone copyto "$SOURCE" "$REMOTE" \
+              --s3-upload-cutoff 64M \
+              --s3-chunk-size 64M \
+              --s3-upload-concurrency 4 \
+              --retries 5 --low-level-retries 10 \
+              --stats 30s --stats-one-line
+            SIZE_LOCAL=$(stat -c %s "$SOURCE")
+            SIZE_R2=$(rclone size "$REMOTE" --json | jq -r .bytes)
+            [[ "$SIZE_LOCAL" == "$SIZE_R2" ]] || {
+              echo "::error::R2 object-size mismatch: $REMOTE"
+              exit 1
+            }
+          done
+          echo "r2_path=$DEST" >> "$GITHUB_OUTPUT"
+          {
+            echo '## Installer available'
+            echo "- Chromium: ${CHROMIUM_VERSION}, Windows x64"
+            echo '- GN args: **unchanged** (`is_official_build=false`)'
+            echo "- R2: `$DEST`"
+            echo '- GitHub Actions: see Artifacts below'
+            echo '- Source checkpoint unchanged'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Windows mini_installer as GitHub artifact
+        if: steps.install_package.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: chromium-mini-installer-${{ github.run_id }}
+          path: |
+            ${{ steps.install_package.outputs.exe }}
+            ${{ steps.install_package.outputs.sha }}
+            installer-export/README.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Final status and resource report
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/ci-metrics.sh" ]; then
+            source "$GITHUB_WORKSPACE/ci-metrics.sh"
+            ci_begin 'Final status'
+          else
+            df -h /
+            free -h
+          fi
+          echo 'Original R2 latest.txt and layers are unchanged by this workflow.'
+
+  windows-smoke:
+    name: Install Chromium and smoke-test Windows sandbox
+    needs: installer
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - name: Download the built mini_installer
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.installer.outputs.installer_artifact }}
+          path: ${{ runner.temp }}\chromium-installer
+
+      - name: Verify checksum and install per-user Chromium
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'chromium-installer'
+          $exe = Get-ChildItem $dir -Filter '*mini_installer.exe' -File -Recurse | Select-Object -First 1
+          if (-not $exe) { throw 'mini_installer.exe missing from downloaded artifact' }
+          $shaFile = "$($exe.FullName).sha256"
+          if (-not (Test-Path $shaFile)) { throw "Missing checksum: $shaFile" }
+          $expected = ((Get-Content $shaFile -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+          $actual = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw 'Installer SHA-256 mismatch' }
+
+          $setup = Start-Process -FilePath $exe.FullName -ArgumentList '--verbose-logging' -Wait -PassThru
+          if ($setup.ExitCode -ne 0) {
+            $log = Join-Path $env:TEMP 'chromium_installer.log'
+            if (Test-Path $log) { Get-Content $log -Tail 100 }
+            throw "Chromium installer exited with $($setup.ExitCode)"
+          }
+          $chrome = Join-Path $env:LOCALAPPDATA 'Chromium\Application\chrome.exe'
+          if (-not (Test-Path $chrome)) {
+            $log = Join-Path $env:TEMP 'chromium_installer.log'
+            if (Test-Path $log) { Get-Content $log -Tail 100 }
+            throw "Chromium not found after installer: $chrome"
+          }
+          Write-Host "Installed: $chrome"
+          "CHROME_INSTALLED_PATH=$chrome" >> $env:GITHUB_ENV
+
+      - name: Launch installed Chromium headless with sandbox enabled
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $chrome = $env:CHROME_INSTALLED_PATH
+          $profile = Join-Path $env:RUNNER_TEMP 'chromium-smoke-profile'
+          $stdout = Join-Path $env:RUNNER_TEMP 'chromium-stdout.txt'
+          $stderr = Join-Path $env:RUNNER_TEMP 'chromium-stderr.txt'
+          $argList = @('--headless', '--disable-gpu', '--no-first-run', '--no-default-browser-check',
+            "--user-data-dir=$profile", '--dump-dom', 'about:blank')
+          $p = Start-Process -FilePath $chrome -ArgumentList $argList -PassThru `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          try {
+            Wait-Process -Id $p.Id -Timeout 90 -ErrorAction Stop
+          } catch {
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            throw 'Chromium headless launch timed out'
+          }
+          $p.Refresh()
+          if ($p.ExitCode -ne 0) {
+            Get-Content $stderr -Tail 80 -ErrorAction SilentlyContinue
+            throw "Installed Chromium exited with $($p.ExitCode)"
+          }
+          if (-not (Select-String -Path $stdout -Pattern '<html' -Quiet)) {
+            Get-Content $stderr -Tail 80 -ErrorAction SilentlyContinue
+            throw 'Chromium did not output an HTML document during headless test'
+          }
+          Write-Host 'PASS: Chromium installer succeeded; browser launched with sandbox enabled.'
+
